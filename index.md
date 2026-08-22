@@ -5,7 +5,7 @@ description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba,
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine.
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-22 — Navidrome 0.63.2 + lyrics plugin (7a).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -23,7 +23,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | Hypervisor | PXVIRT (Proxmox VE 9.0 ARM64 port) | web UI `:8006` |
 | CT 100 | Music Assistant (Docker in LXC) | 192.168.8.213 |
 | CT 101 | AzuraCast (Docker in LXC) — **installed, not running** | 192.168.8.192 |
-| Music server | Navidrome 0.58.0 | `:4533` |
+| Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
 | Radio logging | `icyscan-afrobeats`, `icyscan-afrohouse` (ICY), `flowscan@265` (90s90s API) | logs in `/mnt/nvme/files/icyscan/` |
 | Remote access | Tailscale + subnet router for 192.168.8.0/24 | `YOUR_TAILNET_IP` |
 
@@ -343,7 +343,7 @@ Then `http://192.168.8.192` to finish setup.
 Installed from the official `.deb` (not from a repo — `apt-cache policy` shows it as local-only), running on the **host**, not in a container.
 
 ```bash
-VER=0.58.0
+VER=0.63.2
 curl -fsSL -o /tmp/navidrome.deb \
   "https://github.com/navidrome/navidrome/releases/download/v${VER}/navidrome_${VER}_linux_arm64.deb"
 sudo dpkg -i /tmp/navidrome.deb
@@ -356,6 +356,7 @@ Config at `/etc/navidrome/navidrome.toml`:
 ```toml
 DataFolder = "/var/lib/navidrome"
 MusicFolder = "/mnt/nvme"
+LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,.txt,embedded,nd-lyrics"
 
 [LastFM]
 ApiKey = "<your last.fm api key>"
@@ -370,9 +371,64 @@ sudo systemctl enable --now navidrome
 
 Web UI: `http://192.168.8.191:4533` — or `http://YOUR_TAILNET_IP:4533` remotely.
 
+Upgrading in place from an older version is the same `dpkg -i` over the top, but back the DB up first — schema migrations are one-way:
+
+```bash
+D=/mnt/nvme/backups/navidrome-$(date +%F)
+sudo mkdir -p "$D"                                 # .backup won't create it
+sudo sqlite3 /var/lib/navidrome/navidrome.db ".backup $D/navidrome.db"
+sudo sqlite3 "$D/navidrome.db" "PRAGMA integrity_check;"   # expect: ok
+sudo cp /etc/navidrome/navidrome.toml "$D/"
+```
+
 Two notes on the current state:
 - `MusicFolder` is `/mnt/nvme`, i.e. the whole drive, not just `/mnt/nvme/files`. That's how it is now; narrow it to `/mnt/nvme/files` if you'd rather Navidrome not scan PVE's directories.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
+
+### 7a. Lyrics plugin (`nd-lyrics`)
+
+Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
+
+Requires Navidrome **≥ v0.63.0**.
+
+```bash
+sudo mkdir -p /var/lib/navidrome/plugins
+sudo curl -fsSL -o /var/lib/navidrome/plugins/nd-lyrics.ndp \
+  "https://github.com/J0R6IT0/navidrome-lyrics-plugin/releases/download/v7.2.0/nd-lyrics.ndp"
+sudo chown -R navidrome:navidrome /var/lib/navidrome/plugins
+sudo systemctl restart navidrome
+```
+
+The plugin also has to be named in `LyricsPriority` (already in the toml above). The value is the filename without its extension, and it goes **last** so embedded tags and sidecar files on disk always win:
+
+```toml
+LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,.txt,embedded,nd-lyrics"
+```
+
+Confirm it was picked up:
+
+```bash
+sudo journalctl -u navidrome | grep -i "new plugin"
+# level=info msg="Discovered new plugin" plugin=nd-lyrics
+```
+
+**It registers disabled.** Finish in the web UI → Settings → Plugins → `nd-lyrics`: enable it, then grant it libraries and users. Without that scoping it sits there and never fires.
+
+How it behaves:
+
+- **On demand only.** Nothing is fetched in bulk — a lookup happens when a client asks for one track's lyrics. Results are cached with per-format TTLs (plain 3 days, LRC 7, TTML/ELRC 14) plus a 24 h *negative* cache, so a miss isn't re-queried on every play.
+- **The web UI does not render plugin lyrics.** You need a third-party client — Symfonium, Amperfy, Feishin, Substreamer. The alternative is `writeLyrics`, which saves sidecar `.lrc`/`.ttml` files that Navidrome then reads natively; that also needs "allow write access" granted to the plugin in the UI.
+- **No per-song picker.** Library and user scoping in the UI is the closest thing — enable it for `Albums` and `Now Music`, leave the radio-scrape libraries out.
+
+Worth changing from the defaults:
+
+| Option | Default | Why |
+|---|---|---|
+| `providersList` | `lrclib`, `lyrics.ovh` | Only two. Adding `lrcmux`, `kugou`, `netease`, `qqmusic` widens coverage a lot where LRCLIB is thin. |
+| `providerMode` | `priority` | First hit wins. `bestSyncLevel` keeps looking for word-by-word over line-synced over plain, at the cost of more requests per lookup. |
+| `durationToleranceSeconds` | `3` | The accuracy guard — a result is rejected unless the provider's track length is within this many seconds of yours. Raising it finds more matches, and more wrong ones. |
+| `writeLyrics` | `false` | Turn on to persist lyrics as sidecar files under the music tree. |
+| `stripSectionLabels` | `false` | Drops `[Chorus]`-style labels and credits from the text. |
 
 ---
 
@@ -638,6 +694,10 @@ df -h /mnt/nvme                                    # ~916G, ext4
 # services
 systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 tailscaled smbd
 
+# navidrome + plugin
+/usr/bin/navidrome --version                       # 0.63.2
+ls /var/lib/navidrome/plugins                      # nd-lyrics.ndp
+
 # containers
 sudo pct list                                      # 100 + 101 running
 
@@ -660,6 +720,7 @@ Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191
 ## 11. Things worth knowing before you rebuild
 
 - **Back up first.** The music library under `/mnt/nvme/files` and the icyscan `.txt` history are the only irreplaceable data. Also grab `/etc/navidrome/navidrome.toml` (Last.fm keys), `/etc/pve/lxc/*.conf`, `/var/azuracast/.env`, and `/var/lib/navidrome/` (playlists, play counts, users).
+- **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
 - **No PVE backup jobs are configured.** `/etc/pve/jobs.cfg` is empty and both `dump/` directories are empty — nothing is being backed up automatically. Worth adding a vzdump job to `nvme` storage if you care about the containers.
 - **`zfsutils-linux` is installed** (pulled in by PXVIRT) but no pool exists and the module isn't loaded. Ignore it.
 - **nginx is running on :80 with the stock Debian default page** — nothing is proxied through it. It's an artifact of some earlier plan, not load-bearing. Safe to leave, safe to remove.
