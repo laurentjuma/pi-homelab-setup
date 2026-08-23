@@ -6,3 +6,4 @@ theme: jekyll-theme-cayman
 exclude:
   - flowscan.py
   - README.md
+  - "*.local.md"        # private un-sanitized copies — never render

@@ -5,7 +5,7 @@ description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba,
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-22 — Navidrome 0.63.2 + lyrics plugin (7a).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-22 — Navidrome 0.63.2 + lyrics plugin (7a), whole-disk library removed (7b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -355,8 +355,8 @@ Config at `/etc/navidrome/navidrome.toml`:
 
 ```toml
 DataFolder = "/var/lib/navidrome"
-MusicFolder = "/mnt/nvme"
-LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,.txt,embedded,nd-lyrics"
+MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 7b
+LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,nd-lyrics,.txt,embedded"
 
 [LastFM]
 ApiKey = "<your last.fm api key>"
@@ -382,7 +382,7 @@ sudo cp /etc/navidrome/navidrome.toml "$D/"
 ```
 
 Two notes on the current state:
-- `MusicFolder` is `/mnt/nvme`, i.e. the whole drive, not just `/mnt/nvme/files`. That's how it is now; narrow it to `/mnt/nvme/files` if you'd rather Navidrome not scan PVE's directories.
+- `MusicFolder` points at an empty directory on purpose — libraries live in the DB, not the config. Pointing it at `/mnt/nvme` is what caused the duplicate-indexing problem in 7b, so don't put it back.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
 
 ### 7a. Lyrics plugin (`nd-lyrics`)
@@ -390,6 +390,8 @@ Two notes on the current state:
 Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
 
 Requires Navidrome **≥ v0.63.0**.
+
+Full reference — priority ordering, sidecar behaviour, write-access risks and mitigations: **[Navidrome lyrics](/navidrome-lyrics/)** (`navidrome-lyrics.md`).
 
 ```bash
 sudo mkdir -p /var/lib/navidrome/plugins
@@ -399,10 +401,10 @@ sudo chown -R navidrome:navidrome /var/lib/navidrome/plugins
 sudo systemctl restart navidrome
 ```
 
-The plugin also has to be named in `LyricsPriority` (already in the toml above). The value is the filename without its extension, and it goes **last** so embedded tags and sidecar files on disk always win:
+The plugin also has to be named in `LyricsPriority` (already in the toml above) — the filename without its extension. **Where you put it decides what wins.** Last means local files and embedded tags always beat it; this box puts it after the synced extensions but ahead of `.txt` and `embedded`, so a synced sidecar still wins, then online lyrics are preferred over plain text or baked-in tags:
 
 ```toml
-LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,.txt,embedded,nd-lyrics"
+LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,nd-lyrics,.txt,embedded"
 ```
 
 Confirm it was picked up:
@@ -429,6 +431,35 @@ Worth changing from the defaults:
 | `durationToleranceSeconds` | `3` | The accuracy guard — a result is rejected unless the provider's track length is within this many seconds of yours. Raising it finds more matches, and more wrong ones. |
 | `writeLyrics` | `false` | Turn on to persist lyrics as sidecar files under the music tree. |
 | `stripSectionLabels` | `false` | Drops `[Chorus]`-style labels and credits from the text. |
+
+---
+
+### 7b. Libraries — never let two overlap
+
+Libraries in 0.63 are **rows in the DB**, not toml entries. `MusicFolder` only seeds a default library (id 1) on first run; after that the web UI is the source of truth. This box runs one library per genre folder under `/mnt/nvme/files/`, each granted to its own playback-only user, with the admin granted all of them.
+
+**A library whose root contains another library's root indexes the same files twice.** Leaving `MusicFolder = "/mnt/nvme"` in place alongside per-genre libraries did exactly that here: 13,259 of 15,224 files ended up with two `media_file` rows under two different IDs. That means:
+
+- Play counts and stars attach to a track ID, so listening history splits by whichever library the client happened to browse.
+- Browse and search return everything twice for any account granted both.
+- Backup folders inside the tree get served as real music.
+- The scan walks everything else on the disk — here ~2 GB of Proxmox VM images — to find no audio at all.
+- Clients cache IDs that later vanish, producing `Song not found` and silently dropped scrobbles.
+
+Removing the whole-disk library took the DB from 145 MB to 82 MB and a scan down to ~0.5 s. Check any setup with:
+
+```bash
+sudo sqlite3 /var/lib/navidrome/navidrome.db \
+  "select count(*) from (select l.path||'/'||m.path ap from media_file m
+    join library l on l.id=m.library_id group by ap having count(*)>1);"
+# expect: 0
+```
+
+Cleanup is **not** a one-line `DELETE FROM library`. `media_file`, `album` and `folder` reference `library` *without* `ON DELETE CASCADE`, and `annotation.item_id` has no foreign key at all, so play counts must be merged onto the surviving duplicate first. Two things make it tractable: the FTS indexes are contentless and trigger-maintained, so a plain `DELETE` keeps search consistent; and `media_file.path` is **library-relative**, so duplicates only surface if you compare `library.path || '/' || media_file.path`.
+
+Leave `Scanner.PurgeMissing` at its default `never`. Rows flagged `missing=1` keep their play history and let Navidrome re-match a file that moved — and the setting is global, so using it to tidy one library destroys history everywhere.
+
+Deleting the default library is safe: Navidrome did not recreate one on restart, which is why `MusicFolder` can point at an empty directory afterwards.
 
 ---
 
