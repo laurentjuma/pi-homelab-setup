@@ -1,11 +1,11 @@
 ---
 title: Raspberry Pi 5 — Full Rebuild Guide
-description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, radio track logging, Tailscale.
+description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, radio track logging, Tailscale.
 ---
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-22 — Navidrome 0.63.2 + lyrics plugin (7a), whole-disk library removed (7b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-24 — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (8a), whole-disk library removed (8b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -23,6 +23,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | Hypervisor | PXVIRT (Proxmox VE 9.0 ARM64 port) | web UI `:8006` |
 | CT 100 | Music Assistant (Docker in LXC) | 192.168.8.213 |
 | CT 101 | AzuraCast (Docker in LXC) — **installed, not running** | 192.168.8.192 |
+| CT 102 | Audiobookshelf (Docker in LXC) | 192.168.8.214, web UI `:13378` |
 | Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
 | Radio logging | `icyscan-afrobeats`, `icyscan-afrohouse` (ICY), `flowscan@265` (90s90s API) | logs in `/mnt/nvme/files/icyscan/` |
 | Remote access | Tailscale + subnet router for 192.168.8.0/24 | `YOUR_TAILNET_IP` |
@@ -124,7 +125,7 @@ sudo chown -R youruser:youruser /mnt/nvme/files
 mkdir -p /mnt/nvme/files/icyscan
 ```
 
-`/mnt/nvme/files` holds the music library (`music`, `music_african`, `music_kenyan`, `music_urban`, `music_oldies`, `music_soul_r_n_b`, `music_dancehall_reggae`, `music_eurodance`, `music_nwa`, `_Serato_`, …) plus `icyscan/`. PVE later adds `dump/ images/ private/ snippets/ template/` at `/mnt/nvme` — leave those alone.
+`/mnt/nvme/files` holds the music library (`music`, `music_african`, `music_kenyan`, `music_urban`, `music_oldies`, `music_soul_r_n_b`, `music_dancehall_reggae`, `music_eurodance`, `music_nwa`, `_Serato_`, …) plus `icyscan/`, and — from section 7a — `audiobooks/` and `podcasts/`. PVE later adds `dump/ images/ private/ snippets/ template/` at `/mnt/nvme` — leave those alone.
 
 > **Restoring the music library** is a data copy, not a config step — pull it back from your backup over SMB once section 3 is up.
 
@@ -156,7 +157,7 @@ sudo systemctl enable smbd nmbd
 
 From the Mac: `smb://192.168.8.191/mbogiservershare` (user `youruser`).
 
-> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 7 — that's why the icyscan units don't use `append:`.
+> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 8 — that's why the icyscan units don't use `append:`.
 
 ---
 
@@ -338,7 +339,97 @@ Then `http://192.168.8.192` to finish setup.
 
 ---
 
-## 7. Navidrome
+## 7. CT 102 — Audiobookshelf
+
+Unprivileged LXC, 2 cores / 2 GB, static 192.168.8.214, rootfs on the NVMe, Docker inside. Web UI on `:13378`.
+
+### 7a. Library directories on the host
+
+Audiobookshelf writes to its library folders (podcast downloads land there), so unlike CT 100's music mount this one can't be read-only. The directories stay owned by `youruser` so they're still writable over SMB; the container gets in through a POSIX ACL instead of a chown.
+
+An unprivileged LXC maps container uid 0 → host uid 100000, so that's the id to grant:
+
+```bash
+sudo apt install -y acl
+sudo mkdir -p /mnt/nvme/files/audiobooks /mnt/nvme/files/podcasts
+sudo chown youruser:youruser /mnt/nvme/files/audiobooks /mnt/nvme/files/podcasts
+
+# container root (host uid 100000) rwx — now, and by default on anything created later
+sudo setfacl -R    -m u:100000:rwx /mnt/nvme/files/audiobooks /mnt/nvme/files/podcasts
+sudo setfacl -R -d -m u:100000:rwx /mnt/nvme/files/audiobooks /mnt/nvme/files/podcasts
+```
+
+Both live under the Samba share root, so they appear as `mbogiservershare/audiobooks` and `mbogiservershare/podcasts` with no extra config — that's how you get books onto the box.
+
+### 7b. The container
+
+Built from the Debian 13 template, not the 2023 jammy one CT 100/101 use:
+
+```bash
+sudo pveam update
+sudo pveam download local debian-13-standard_13.6-1_arm64.tar.zst
+
+sudo pct create 102 local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst \
+  --hostname audiobookshelf \
+  --arch arm64 --ostype debian \
+  --cores 2 --memory 2048 --swap 512 \
+  --rootfs nvme:16 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.8.214/24,gw=192.168.8.1,type=veth \
+  --nameserver "1.1.1.1 8.8.8.8" \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+sudo pct set 102 -mp0 /mnt/nvme/files/audiobooks,mp=/media/audiobooks
+sudo pct set 102 -mp1 /mnt/nvme/files/podcasts,mp=/media/podcasts
+
+sudo pct start 102
+```
+
+`nesting=1` for Docker, same as CT 100. Rootfs on `nvme:16`, not the SD card.
+
+### 7c. Audiobookshelf itself
+
+```bash
+sudo pct enter 102
+
+apt update && apt install -y ca-certificates curl
+curl -fsSL https://get.docker.com | sh
+
+mkdir -p /opt/audiobookshelf/config /opt/audiobookshelf/metadata
+
+docker run -d \
+  --name audiobookshelf \
+  --restart unless-stopped \
+  -p 13378:80 \
+  -e TZ=Europe/London \
+  -v /opt/audiobookshelf/config:/config \
+  -v /opt/audiobookshelf/metadata:/metadata \
+  -v /media/audiobooks:/audiobooks \
+  -v /media/podcasts:/podcasts \
+  ghcr.io/advplyr/audiobookshelf:latest
+
+exit
+```
+
+The image listens on port 80 inside the container; 13378 is Audiobookshelf's conventional external port. Config and metadata — the SQLite DB, cached covers, backups — sit on the container rootfs, so nothing it generates ends up in the share.
+
+Then open `http://192.168.8.214:13378` and create the root account on first load; the server stays uninitialised until you do. Add the libraries in the UI afterwards: `/audiobooks` as a Books library, `/podcasts` as a Podcasts library.
+
+Check it without a browser:
+
+```bash
+curl -s http://192.168.8.214:13378/status
+# {"app":"audiobookshelf","serverVersion":"2.36.0","isInit":false,...}
+```
+
+> `isInit: false` flips to `true` once the root account exists — a one-line way to tell "server up" from "server up and set up".
+
+Finally, add a card for it to the `Home Server` landing page nginx serves at `http://192.168.8.191` (`/var/www/html/index.html`) — copy an existing `<a class="card">` block and point it at `http://192.168.8.214:13378`.
+
+---
+
+## 8. Navidrome
 
 Installed from the official `.deb` (not from a repo — `apt-cache policy` shows it as local-only), running on the **host**, not in a container.
 
@@ -385,7 +476,7 @@ Two notes on the current state:
 - `MusicFolder` points at an empty directory on purpose — libraries live in the DB, not the config. Pointing it at `/mnt/nvme` is what caused the duplicate-indexing problem in 7b, so don't put it back.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
 
-### 7a. Lyrics plugin (`nd-lyrics`)
+### 8a. Lyrics plugin (`nd-lyrics`)
 
 Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
 
@@ -434,7 +525,7 @@ Worth changing from the defaults:
 
 ---
 
-### 7b. Libraries — never let two overlap
+### 8b. Libraries — never let two overlap
 
 Libraries in 0.63 are **rows in the DB**, not toml entries. `MusicFolder` only seeds a default library (id 1) on first run; after that the web UI is the source of truth. This box runs one library per genre folder under `/mnt/nvme/files/`, each granted to its own playback-only user, with the admin granted all of them.
 
@@ -463,11 +554,11 @@ Deleting the default library is safe: Navidrome did not recreate one on restart,
 
 ---
 
-## 8. ICY radio metadata loggers
+## 9. ICY radio metadata loggers
 
 Two systemd services scrape ICY stream metadata and append every track change to a `.txt` on the share.
 
-### 8a. The script
+### 9a. The script
 
 The repo is your fork, which carries a fix (`Fix permanent desync when metadata straddles a chunk boundary`) not in upstream:
 
@@ -481,7 +572,7 @@ git remote add upstream https://github.com/lucvanbraekel/icy-meta.git
 
 Needs `python3-requests` (installed in section 1).
 
-### 8b. Units
+### 9b. Units
 
 `/etc/systemd/system/icyscan-afrobeats.service`:
 
@@ -546,7 +637,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now icyscan-afrobeats icyscan-afrohouse
 ```
 
-> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 8b instead.
+> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 9b instead.
 
 **Why awk owns the file and not systemd:** `StandardOutput=append:` resolves the path once at start and binds to the *inode*. Finder replacing the file over SMB (unlink-then-create) left the service writing into an orphaned inode while the visible file stayed at 0 bytes — silently, nothing in the journal. `close(LOG)` after each line forces a path re-resolve, so a deleted log comes back within one song. **Any new station unit must use this pattern.**
 
@@ -554,7 +645,7 @@ Two known, expected behaviours: the script reconnects to the stream roughly once
 
 Logs land at `smb://192.168.8.191/mbogiservershare/icyscan/`.
 
-### 8c. 90s90s — `flowscan`, polling the iris feed
+### 9c. 90s90s — `flowscan`, polling the iris feed
 
 90s90s doesn't publish tracks over ICY (see the note above), but its web player does. The Nuxt bundles call an "iris" endpoint:
 
@@ -649,11 +740,11 @@ sudo systemctl enable --now flowscan@261
 
 ---
 
-## 9. Tailscale remote access
+## 10. Tailscale remote access
 
 The LAN sits behind a GL.iNet router whose IPv4 egress is an M247 commercial-VPN range, on top of likely CGNAT — **there is no inbound path**, so port forwarding and DDNS are impossible. An outbound tunnel is the only option.
 
-### 9a. Install and join
+### 10a. Install and join
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -669,7 +760,7 @@ Follow the printed URL and log in as `your-tailscale-account`. Then in the Tails
 
 Result: tailnet IP `YOUR_TAILNET_IP`, MagicDNS `raspberrypi.your-tailnet.ts.net`.
 
-### 9b. Persist IP forwarding
+### 10b. Persist IP forwarding
 
 ```bash
 printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
@@ -677,7 +768,7 @@ printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 ```
 
-### 9c. UDP GRO tuning on the bridge
+### 10c. UDP GRO tuning on the bridge
 
 Throughput fix for subnet routing — needs to reapply on every boot, hence the oneshot unit.
 
@@ -703,7 +794,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tailscale-gro
 ```
 
-### 9d. Using it
+### 10d. Using it
 
 Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, WireGuard already encrypts it:
 
@@ -716,7 +807,7 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 
 ---
 
-## 10. Verification checklist
+## 11. Verification checklist
 
 ```bash
 # storage
@@ -730,7 +821,8 @@ systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 t
 ls /var/lib/navidrome/plugins                      # nd-lyrics.ndp
 
 # containers
-sudo pct list                                      # 100 + 101 running
+sudo pct list                                      # 100 + 101 + 102 running
+curl -s http://192.168.8.214:13378/status          # audiobookshelf, serverVersion 2.36.0
 
 # listening ports
 sudo ss -tlnp | grep -E ':(22|80|445|4533|8006)'
@@ -744,17 +836,17 @@ tailscale status
 tailscale ip -4                                    # YOUR_TAILNET_IP
 ```
 
-Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `https://192.168.8.191:8006`.
+Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `https://192.168.8.191:8006`.
 
 ---
 
-## 11. Things worth knowing before you rebuild
+## 12. Things worth knowing before you rebuild
 
 - **Back up first.** The music library under `/mnt/nvme/files` and the icyscan `.txt` history are the only irreplaceable data. Also grab `/etc/navidrome/navidrome.toml` (Last.fm keys), `/etc/pve/lxc/*.conf`, `/var/azuracast/.env`, and `/var/lib/navidrome/` (playlists, play counts, users).
 - **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
 - **No PVE backup jobs are configured.** `/etc/pve/jobs.cfg` is empty and both `dump/` directories are empty — nothing is being backed up automatically. Worth adding a vzdump job to `nvme` storage if you care about the containers.
 - **`zfsutils-linux` is installed** (pulled in by PXVIRT) but no pool exists and the module isn't loaded. Ignore it.
-- **nginx is running on :80 with the stock Debian default page** — nothing is proxied through it. It's an artifact of some earlier plan, not load-bearing. Safe to leave, safe to remove.
+- **nginx on :80 serves a hand-written "Home Server" landing page** (`/var/www/html/index.html`) — a dark card grid linking out to Music Assistant, Navidrome and Audiobookshelf. Nothing is *proxied* through nginx; the cards are plain absolute links to each service's own host and port, so adding a service means adding an `<a class="card">` block by hand. The stock Debian page is still there as `index.nginx-debian.html`.
 - **`samba-ad-dc.service` is enabled** but the server is a standalone file server. Harmless.
 - **`postfix` is running** on localhost only, for PVE's mail notifications.
-- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–6) after PXVIRT. Everything else is independent.
+- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–7) after PXVIRT. Everything else is independent.
