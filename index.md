@@ -1,11 +1,11 @@
 ---
 title: Raspberry Pi 5 — Full Rebuild Guide
-description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, radio track logging, Tailscale.
+description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, Plex, Emby, radio track logging, Tailscale.
 ---
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-24 — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (8a), whole-disk library removed (8b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-28 — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (10a), whole-disk library removed (10b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -24,6 +24,8 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | CT 100 | Music Assistant (Docker in LXC) | 192.168.8.213 |
 | CT 101 | AzuraCast (Docker in LXC) — **installed, not running** | 192.168.8.192 |
 | CT 102 | Audiobookshelf (Docker in LXC) | 192.168.8.214, web UI `:13378` |
+| CT 103 | Plex (Docker in LXC) | 192.168.8.215, web UI `:32400` |
+| CT 104 | Emby (Docker in LXC) | 192.168.8.216, web UI `:8096` |
 | Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
 | Radio logging | `icyscan-afrobeats`, `icyscan-afrohouse` (ICY), `flowscan@265` (90s90s API) | logs in `/mnt/nvme/files/icyscan/` |
 | Remote access | Tailscale + subnet router for 192.168.8.0/24 | `YOUR_TAILNET_IP` |
@@ -125,7 +127,7 @@ sudo chown -R youruser:youruser /mnt/nvme/files
 mkdir -p /mnt/nvme/files/icyscan
 ```
 
-`/mnt/nvme/files` holds the music library (`music`, `music_african`, `music_kenyan`, `music_urban`, `music_oldies`, `music_soul_r_n_b`, `music_dancehall_reggae`, `music_eurodance`, `music_nwa`, `_Serato_`, …) plus `icyscan/`, and — from section 7a — `audiobooks/` and `podcasts/`. PVE later adds `dump/ images/ private/ snippets/ template/` at `/mnt/nvme` — leave those alone.
+`/mnt/nvme/files` holds the music library (`music`, `music_african`, `music_kenyan`, `music_urban`, `music_oldies`, `music_soul_r_n_b`, `music_dancehall_reggae`, `music_eurodance`, `music_nwa`, `_Serato_`, …) plus `icyscan/`, and — from sections 7a and 8a — `audiobooks/`, `podcasts/`, `movies/` and `tv/`. PVE later adds `dump/ images/ private/ snippets/ template/` at `/mnt/nvme` — leave those alone.
 
 > **Restoring the music library** is a data copy, not a config step — pull it back from your backup over SMB once section 3 is up.
 
@@ -157,7 +159,7 @@ sudo systemctl enable smbd nmbd
 
 From the Mac: `smb://192.168.8.191/mbogiservershare` (user `youruser`).
 
-> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 8 — that's why the icyscan units don't use `append:`.
+> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 11 — that's why the icyscan units don't use `append:`.
 
 ---
 
@@ -429,7 +431,186 @@ Finally, add a card for it to the `Home Server` landing page nginx serves at `ht
 
 ---
 
-## 8. Navidrome
+## 8. CT 103 — Plex
+
+Unprivileged LXC, 4 cores / 4 GB, static 192.168.8.215, rootfs on the NVMe, Docker inside. Web UI on `:32400`.
+
+### 8a. Library directories on the host
+
+Same treatment as 7a. Plex itself writes nothing into the library, but the directories still have to be writable over SMB — that's how media gets onto the box — *and* readable by the container, so they're owned by `youruser` with a POSIX ACL for container root (host uid 100000):
+
+```bash
+sudo mkdir -p /mnt/nvme/files/movies /mnt/nvme/files/tv
+sudo chown youruser:youruser /mnt/nvme/files/movies /mnt/nvme/files/tv
+
+sudo setfacl -R    -m u:100000:rwx /mnt/nvme/files/movies /mnt/nvme/files/tv
+sudo setfacl -R -d -m u:100000:rwx /mnt/nvme/files/movies /mnt/nvme/files/tv
+```
+
+Both sit under the share root, so they show up as `mbogiservershare/movies` and `mbogiservershare/tv` with no extra Samba config.
+
+### 8b. The container
+
+Debian 13 template, same as CT 102:
+
+```bash
+sudo pct create 103 local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst \
+  --hostname plex \
+  --arch arm64 --ostype debian \
+  --cores 4 --memory 4096 --swap 512 \
+  --rootfs nvme:32 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.8.215/24,gw=192.168.8.1,type=veth \
+  --nameserver "1.1.1.1 8.8.8.8" \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+sudo pct set 103 -mp0 /mnt/nvme/files/movies,mp=/media/movies
+sudo pct set 103 -mp1 /mnt/nvme/files/tv,mp=/media/tv
+sudo pct set 103 -mp2 /mnt/nvme/files,mp=/media/music,ro=1
+
+sudo pct start 103
+```
+
+More cores and RAM than the other containers because every transcode here is CPU-only — see the note at the end of 8c. `nvme:32` rather than CT 102's 16: Plex's metadata, thumbnails and transcode scratch all live on the container rootfs and grow with the library. `mp2` is the whole `files` tree read-only, the same mount CT 100 gets, so Plex can serve the music without a second copy of it.
+
+### 8c. Plex itself
+
+```bash
+sudo pct enter 103
+
+apt update && apt install -y ca-certificates curl
+curl -fsSL https://get.docker.com | sh
+
+mkdir -p /opt/plex/config /opt/plex/transcode
+
+docker run -d \
+  --name plex \
+  --restart unless-stopped \
+  --network host \
+  -e PUID=0 -e PGID=0 \
+  -e TZ=Europe/London \
+  -e VERSION=docker \
+  -e ADVERTISE_IP=http://192.168.8.215:32400/ \
+  -e ALLOWED_NETWORKS=192.168.8.0/24 \
+  -v /opt/plex/config:/config \
+  -v /opt/plex/transcode:/transcode \
+  -v /media/movies:/movies \
+  -v /media/tv:/tv \
+  -v /media/music:/music:ro \
+  lscr.io/linuxserver/plex:latest
+
+exit
+```
+
+`lscr.io/linuxserver/plex` has a real arm64 build — check with `docker image inspect --format '{{.Architecture}}'` if in doubt.
+
+**Host networking, not `-p 32400:32400`.** Plex's GDM client discovery broadcasts on 32410–32414/udp and bridged Docker networking swallows it; host mode gives the container the LXC's own network namespace instead. `ADVERTISE_IP` then pins what the server tells clients about itself, and `ALLOWED_NETWORKS` keeps the LAN from being prompted to log in.
+
+`PUID=0`/`PGID=0` is container root, which an unprivileged LXC maps to host uid 100000 — exactly the uid 8a handed the ACL to.
+
+Check it without a browser:
+
+```bash
+curl -s http://192.168.8.215:32400/identity
+# <MediaContainer size="0" apiVersion="1.2.2" claimed="0" machineIdentifier="…" version="1.43.3.10896-cb3ebc72d">
+```
+
+> `claimed="0"` is Plex's version of Audiobookshelf's `isInit: false` — the server is up but not yet tied to an account.
+
+Then open `http://192.168.8.215:32400/web` **from a machine on 192.168.8.0/24** and run the wizard. Plex only lets you claim an unclaimed server from its own subnet; to sidestep that, grab a token from <https://www.plex.tv/claim/> (valid 4 minutes) and add `-e PLEX_CLAIM=claim-xxxxxxxx` to the `docker run` so it comes up already linked.
+
+Add `/movies` and `/tv` as libraries. For music, point the library at a specific subfolder — `/music/music_albums`, say — **not** at `/music`, which is the whole `files` tree and would drag in `audiobooks/`, `icyscan/` and `_Serato_`.
+
+> **No hardware transcoding on this box.** The Pi 5's video engine isn't something Plex can drive, so every transcode is software on 4 Cortex-A76 cores. Direct play is fine (it's just a file read), audio transcode is fine, 1080p video transcode is marginal and 4K isn't happening. Set clients to "Original" quality and it stops mattering.
+
+Finally, add a card for it to the `Home Server` landing page, same as 7c — `http://192.168.8.215:32400/web`.
+
+---
+
+## 9. CT 104 — Emby
+
+Unprivileged LXC, 4 cores / 3 GB, static 192.168.8.216, rootfs on the NVMe, Docker inside. Web UI on `:8096`. It points at the same `movies`/`tv` directories as Plex — neither server writes into the library, so the two coexist with no extra work.
+
+### 9a. Library directories on the host
+
+Nothing new to do: 8a already created `/mnt/nvme/files/movies` and `/mnt/nvme/files/tv` owned by `youruser` with a POSIX ACL for container root (host uid 100000), and unprivileged CT 104 maps to that same uid. If you're building this box without Plex, run 8a first — it's the only part of section 8 Emby depends on.
+
+### 9b. The container
+
+Debian 13 template, same as CT 102 and 103:
+
+```bash
+sudo pct create 104 local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst \
+  --hostname emby \
+  --arch arm64 --ostype debian \
+  --cores 4 --memory 3072 --swap 512 \
+  --rootfs nvme:24 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.8.216/24,gw=192.168.8.1,type=veth \
+  --nameserver "1.1.1.1 8.8.8.8" \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+sudo pct set 104 -mp0 /mnt/nvme/files/movies,mp=/media/movies
+sudo pct set 104 -mp1 /mnt/nvme/files/tv,mp=/media/tv
+sudo pct set 104 -mp2 /mnt/nvme/files,mp=/media/music,ro=1
+
+sudo pct start 104
+```
+
+Same three mounts as CT 103, so both servers see an identical view of the media.
+
+4 cores because transcoding here is CPU-only, same as Plex. **3 GB rather than 4**, though: the box has 8 GB and CT 103 already claims 4. LXC `memory` is a cap and not a reservation, so nothing breaks the moment you overcommit, but two media servers both free to take 4 GB while Navidrome and Samba run on the host is how you meet the OOM killer. `nvme:24` rather than CT 103's 32 — Emby's metadata, images and transcode scratch also live on the container rootfs, but its appetite is smaller than Plex's.
+
+### 9c. Emby itself
+
+```bash
+sudo pct enter 104
+
+apt update && apt install -y ca-certificates curl
+curl -fsSL https://get.docker.com | sh
+
+mkdir -p /opt/emby/config /opt/emby/transcode
+
+docker run -d \
+  --name emby \
+  --restart unless-stopped \
+  --network host \
+  -e PUID=0 -e PGID=0 \
+  -e TZ=Europe/London \
+  -v /opt/emby/config:/config \
+  -v /opt/emby/transcode:/transcode \
+  -v /media/movies:/movies \
+  -v /media/tv:/tv \
+  -v /media/music:/music:ro \
+  lscr.io/linuxserver/emby:latest
+
+exit
+```
+
+`lscr.io/linuxserver/emby` is multi-arch and resolves to a real arm64 build — `docker image inspect --format '{{.Architecture}}'` says `arm64`. Emby's own `emby/embyserver` is multi-arch too; `emby/embyserver_arm64v8` publishes no manifest you can inspect, so don't reach for it.
+
+Host networking again, for the same class of reason as Plex: Emby's apps find the server by broadcasting on 7359/udp, and DLNA uses 1900/udp — bridged Docker swallows both. `PUID=0`/`PGID=0` is container root → host uid 100000, the uid 8a handed the ACL to.
+
+Check it without a browser:
+
+```bash
+curl -s http://192.168.8.216:8096/System/Info/Public
+# {"LocalAddresses":[],"RemoteAddresses":[],"ServerName":"emby","Version":"4.9.5.0","Id":"fb08c7d3…"}
+```
+
+> Unlike Plex there's no claim token and no account to link — but also nothing guarding the wizard. **The first browser to reach `:8096` gets to create the admin user**, so open `http://192.168.8.216:8096` and finish the wizard now rather than later.
+
+Add `/movies` and `/tv` as libraries. For music, point the library at a specific subfolder — `/music/music_albums`, say — **not** at `/music`, which is the whole `files` tree and would drag in `audiobooks/`, `icyscan/` and `_Serato_`.
+
+> **No hardware transcoding here either** — see the note at the end of 8c; it applies unchanged. Emby gates HW acceleration behind Premiere anyway, and the Pi 5's video engine isn't something it can drive.
+
+Finally, add a card for it to the `Home Server` landing page, same as 7c — `http://192.168.8.216:8096`.
+
+---
+
+## 10. Navidrome
 
 Installed from the official `.deb` (not from a repo — `apt-cache policy` shows it as local-only), running on the **host**, not in a container.
 
@@ -446,7 +627,7 @@ Config at `/etc/navidrome/navidrome.toml`:
 
 ```toml
 DataFolder = "/var/lib/navidrome"
-MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 7b
+MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 10b
 LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,nd-lyrics,.txt,embedded"
 
 [LastFM]
@@ -476,7 +657,7 @@ Two notes on the current state:
 - `MusicFolder` points at an empty directory on purpose — libraries live in the DB, not the config. Pointing it at `/mnt/nvme` is what caused the duplicate-indexing problem in 7b, so don't put it back.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
 
-### 8a. Lyrics plugin (`nd-lyrics`)
+### 10a. Lyrics plugin (`nd-lyrics`)
 
 Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
 
@@ -525,7 +706,7 @@ Worth changing from the defaults:
 
 ---
 
-### 8b. Libraries — never let two overlap
+### 10b. Libraries — never let two overlap
 
 Libraries in 0.63 are **rows in the DB**, not toml entries. `MusicFolder` only seeds a default library (id 1) on first run; after that the web UI is the source of truth. This box runs one library per genre folder under `/mnt/nvme/files/`, each granted to its own playback-only user, with the admin granted all of them.
 
@@ -554,11 +735,11 @@ Deleting the default library is safe: Navidrome did not recreate one on restart,
 
 ---
 
-## 9. ICY radio metadata loggers
+## 11. ICY radio metadata loggers
 
 Two systemd services scrape ICY stream metadata and append every track change to a `.txt` on the share.
 
-### 9a. The script
+### 11a. The script
 
 The repo is your fork, which carries a fix (`Fix permanent desync when metadata straddles a chunk boundary`) not in upstream:
 
@@ -572,7 +753,7 @@ git remote add upstream https://github.com/lucvanbraekel/icy-meta.git
 
 Needs `python3-requests` (installed in section 1).
 
-### 9b. Units
+### 11b. Units
 
 `/etc/systemd/system/icyscan-afrobeats.service`:
 
@@ -637,7 +818,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now icyscan-afrobeats icyscan-afrohouse
 ```
 
-> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 9b instead.
+> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 11c instead.
 
 **Why awk owns the file and not systemd:** `StandardOutput=append:` resolves the path once at start and binds to the *inode*. Finder replacing the file over SMB (unlink-then-create) left the service writing into an orphaned inode while the visible file stayed at 0 bytes — silently, nothing in the journal. `close(LOG)` after each line forces a path re-resolve, so a deleted log comes back within one song. **Any new station unit must use this pattern.**
 
@@ -645,7 +826,7 @@ Two known, expected behaviours: the script reconnects to the stream roughly once
 
 Logs land at `smb://192.168.8.191/mbogiservershare/icyscan/`.
 
-### 9c. 90s90s — `flowscan`, polling the iris feed
+### 11c. 90s90s — `flowscan`, polling the iris feed
 
 90s90s doesn't publish tracks over ICY (see the note above), but its web player does. The Nuxt bundles call an "iris" endpoint:
 
@@ -740,11 +921,11 @@ sudo systemctl enable --now flowscan@261
 
 ---
 
-## 10. Tailscale remote access
+## 12. Tailscale remote access
 
 The LAN sits behind a GL.iNet router whose IPv4 egress is an M247 commercial-VPN range, on top of likely CGNAT — **there is no inbound path**, so port forwarding and DDNS are impossible. An outbound tunnel is the only option.
 
-### 10a. Install and join
+### 12a. Install and join
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -760,7 +941,7 @@ Follow the printed URL and log in as `your-tailscale-account`. Then in the Tails
 
 Result: tailnet IP `YOUR_TAILNET_IP`, MagicDNS `raspberrypi.your-tailnet.ts.net`.
 
-### 10b. Persist IP forwarding
+### 12b. Persist IP forwarding
 
 ```bash
 printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
@@ -768,7 +949,7 @@ printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 ```
 
-### 10c. UDP GRO tuning on the bridge
+### 12c. UDP GRO tuning on the bridge
 
 Throughput fix for subnet routing — needs to reapply on every boot, hence the oneshot unit.
 
@@ -794,7 +975,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tailscale-gro
 ```
 
-### 10d. Using it
+### 12d. Using it
 
 Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, WireGuard already encrypts it:
 
@@ -802,12 +983,14 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 - Proxmox — `https://YOUR_TAILNET_IP:8006`
 - SSH — `ssh youruser@YOUR_TAILNET_IP`
 - Music Assistant — `http://192.168.8.213:8095` (via the subnet route)
+- Plex — `http://192.168.8.215:32400/web` (via the subnet route)
+- Emby — `http://192.168.8.216:8096` (via the subnet route)
 
 `tailscale netcheck` reports `MappingVariesByDestIP: true` (symmetric NAT), so connections often relay through the London DERP rather than going peer-to-peer. Fine for audio; expect less headroom for 4K video.
 
 ---
 
-## 11. Verification checklist
+## 13. Verification checklist
 
 ```bash
 # storage
@@ -821,11 +1004,13 @@ systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 t
 ls /var/lib/navidrome/plugins                      # nd-lyrics.ndp
 
 # containers
-sudo pct list                                      # 100 + 101 + 102 running
+sudo pct list                                      # 100 + 101 + 102 + 103 + 104 running
 curl -s http://192.168.8.214:13378/status          # audiobookshelf, serverVersion 2.36.0
+curl -s http://192.168.8.215:32400/identity        # plex, version 1.43.3.10896
+curl -s http://192.168.8.216:8096/System/Info/Public   # emby, Version 4.9.5.0
 
 # listening ports
-sudo ss -tlnp | grep -E ':(22|80|445|4533|8006)'
+sudo ss -tlnp | grep -E ':(22|80|445|4533|8006|32400)'
 
 # radio logs growing
 tail -3 /mnt/nvme/files/icyscan/afrobeats.txt
@@ -836,17 +1021,17 @@ tailscale status
 tailscale ip -4                                    # YOUR_TAILNET_IP
 ```
 
-Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `https://192.168.8.191:8006`.
+Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `https://192.168.8.191:8006`.
 
 ---
 
-## 12. Things worth knowing before you rebuild
+## 14. Things worth knowing before you rebuild
 
 - **Back up first.** The music library under `/mnt/nvme/files` and the icyscan `.txt` history are the only irreplaceable data. Also grab `/etc/navidrome/navidrome.toml` (Last.fm keys), `/etc/pve/lxc/*.conf`, `/var/azuracast/.env`, and `/var/lib/navidrome/` (playlists, play counts, users).
 - **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
 - **No PVE backup jobs are configured.** `/etc/pve/jobs.cfg` is empty and both `dump/` directories are empty — nothing is being backed up automatically. Worth adding a vzdump job to `nvme` storage if you care about the containers.
 - **`zfsutils-linux` is installed** (pulled in by PXVIRT) but no pool exists and the module isn't loaded. Ignore it.
-- **nginx on :80 serves a hand-written "Home Server" landing page** (`/var/www/html/index.html`) — a dark card grid linking out to Music Assistant, Navidrome and Audiobookshelf. Nothing is *proxied* through nginx; the cards are plain absolute links to each service's own host and port, so adding a service means adding an `<a class="card">` block by hand. The stock Debian page is still there as `index.nginx-debian.html`.
+- **nginx on :80 serves a hand-written "Home Server" landing page** (`/var/www/html/index.html`) — a dark card grid linking out to Music Assistant, Navidrome, Audiobookshelf, Plex and Emby. Nothing is *proxied* through nginx; the cards are plain absolute links to each service's own host and port, so adding a service means adding an `<a class="card">` block by hand. The stock Debian page is still there as `index.nginx-debian.html`.
 - **`samba-ad-dc.service` is enabled** but the server is a standalone file server. Harmless.
 - **`postfix` is running** on localhost only, for PVE's mail notifications.
-- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–7) after PXVIRT. Everything else is independent.
+- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–9) after PXVIRT. Everything else is independent.
