@@ -1,11 +1,11 @@
 ---
 title: Raspberry Pi 5 — Full Rebuild Guide
-description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, Plex, Emby, radio track logging, Tailscale.
+description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, Plex, Emby, goPodder, radio track logging, Tailscale.
 ---
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-08-28 — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (10a), whole-disk library removed (10b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-07 — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 15). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (11a), whole-disk library removed (11b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -26,6 +26,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | CT 102 | Audiobookshelf (Docker in LXC) | 192.168.8.214, web UI `:13378` |
 | CT 103 | Plex (Docker in LXC) | 192.168.8.215, web UI `:32400` |
 | CT 104 | Emby (Docker in LXC) | 192.168.8.216, web UI `:8096` |
+| CT 105 | goPodder (Docker in LXC) — podcast sync, gpodder.net API | 192.168.8.217, web UI `:8080` |
 | Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
 | Radio logging | `icyscan-afrobeats`, `icyscan-afrohouse` (ICY), `flowscan@265` (90s90s API) | logs in `/mnt/nvme/files/icyscan/` |
 | Remote access | Tailscale + subnet router for 192.168.8.0/24 | `YOUR_TAILNET_IP` |
@@ -159,7 +160,7 @@ sudo systemctl enable smbd nmbd
 
 From the Mac: `smb://192.168.8.191/mbogiservershare` (user `youruser`).
 
-> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 11 — that's why the icyscan units don't use `append:`.
+> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 12 — that's why the icyscan units don't use `append:`.
 
 ---
 
@@ -610,7 +611,95 @@ Finally, add a card for it to the `Home Server` landing page, same as 7c — `ht
 
 ---
 
-## 10. Navidrome
+## 10. CT 105 — goPodder
+
+Unprivileged LXC, 1 core / 512 MB, static 192.168.8.217, rootfs on the NVMe, Docker inside. Web UI on `:8080`.
+
+[goPodder](https://github.com/cbrgm/gopodder) is a gpodder.net-compatible **sync** server — subscriptions, episode progress and device registrations, kept in step across podcast apps. It is not a media server and not a feed reader: it never fetches a feed and makes no outbound connections at all, so unlike every other container here it needs no view of the library and touches nothing under `/mnt/nvme`. AntennaPod on the phone and gPodder on the desktop both point at it and share one state.
+
+### 10a. The container
+
+Same Debian 13 template as CT 102–104, sized far smaller — the whole server is one Go binary:
+
+```bash
+sudo pct create 105 local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst \
+  --hostname gopodder \
+  --arch arm64 --ostype debian \
+  --cores 1 --memory 512 --swap 512 \
+  --rootfs nvme:8 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.8.217/24,gw=192.168.8.1,type=veth \
+  --nameserver "1.1.1.1 8.8.8.8" \
+  --features nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+sudo pct start 105
+```
+
+No `pct set … -mp0` here. Every other container in this guide gets the media tree bind-mounted; this one stores a single SQLite file and would never read the library, so handing it a mount is only a wider blast radius. `nvme:8` and 512 MB rather than CT 104's 24 GB and 3 GB for the same reason — there is no metadata cache and no transcode scratch to hold.
+
+### 10b. goPodder itself
+
+```bash
+sudo pct enter 105
+
+apt update && apt install -y ca-certificates curl
+curl -fsSL https://get.docker.com | sh
+
+mkdir -p /opt/gopodder/data
+
+docker run -d \
+  --name gopodder \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e TZ=Europe/London \
+  -v /opt/gopodder/data:/data \
+  ghcr.io/cbrgm/gopodder:v1.2.5 \
+  serve --db-path /data/gopodder.db
+
+exit
+```
+
+`ghcr.io/cbrgm/gopodder` publishes a real arm64 manifest — `docker image inspect --format '{{.Architecture}}'` says `arm64`.
+
+**Pin the tag.** `:latest` is built from `main` on every push, not from a release: pulling it here gave `version=1-5-g1b7a47c-dirty`, five commits past a tag and flagged dirty. `v1.2.5` is the actual release. For something that owns your listening state, take the tagged one and bump it deliberately.
+
+Published ports rather than the `--network host` that Plex and Emby need — nothing here depends on broadcast or DLNA discovery, so the container keeps its own netns and exposes exactly one port.
+
+**`--db-path /data/gopodder.db` is the entire persistence story.** Left off, the image writes `gopodder.db` into its own working directory inside the writable layer: it survives restarts, looks completely fine, and disappears the first time the container is recreated to pick up a new tag. Point it at the bind mount or you are running a database that your next upgrade throws away.
+
+Check it without a browser:
+
+```bash
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' http://192.168.8.217:8080/
+# 303 http://192.168.8.217:8080/setup
+
+sudo pct exec 105 -- docker logs gopodder | tail -2
+# level=INFO msg=goPodder version=1.2.5 revision=6d043cf go=go1.27.0 platform=linux/arm64
+# level=INFO msg="starting server" addr=0.0.0.0:8080
+```
+
+> Same trap as Emby: **the first browser to reach `/setup` creates the admin account**, and nothing guards it. Open `http://192.168.8.217:8080` and finish setup now rather than later.
+
+Then create a goPodder **user** on the Users tab — a separate thing from the admin login — and give those credentials to the podcast apps, not the admin ones.
+
+Backups are a file copy; it runs in WAL mode, so it is safe while the server is up:
+
+```bash
+sudo pct exec 105 -- cp /opt/gopodder/data/gopodder.db /tmp/gopodder-$(date +%F).db
+```
+
+### 10c. Pointing the apps at it, and the HTTPS catch
+
+In the app this is the "gpodder.net sync" / "Synchronize subscriptions" setting with a custom server — `http://192.168.8.217:8080`, then the goPodder user's credentials.
+
+**AntennaPod requires HTTPS and goPodder does not terminate TLS**, so plain `http://` will not do for the phone. Desktop gPodder and Cardo accept HTTP and work as-is. The cheap fix for AntennaPod is the tailnet (section 13) — `tailscale cert` plus `tailscale serve` on the host gives a real certificate on a MagicDNS name with no port forwarding; nginx on :80 could also front it, but then you are minting certificates for a LAN name. Either way, do not reach for Funnel unless the phone genuinely has to sync from outside the tailnet: that publishes the login page to the internet.
+
+Finally, add a card for it to the dashboard — an entry in `TARGETS` in `/opt/hqdash/hqdash.py`, then `sudo systemctl restart hqdash`.
+
+---
+
+## 11. Navidrome
 
 Installed from the official `.deb` (not from a repo — `apt-cache policy` shows it as local-only), running on the **host**, not in a container.
 
@@ -627,7 +716,7 @@ Config at `/etc/navidrome/navidrome.toml`:
 
 ```toml
 DataFolder = "/var/lib/navidrome"
-MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 10b
+MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 11b
 LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,nd-lyrics,.txt,embedded"
 
 [LastFM]
@@ -657,7 +746,7 @@ Two notes on the current state:
 - `MusicFolder` points at an empty directory on purpose — libraries live in the DB, not the config. Pointing it at `/mnt/nvme` is what caused the duplicate-indexing problem in 7b, so don't put it back.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
 
-### 10a. Lyrics plugin (`nd-lyrics`)
+### 11a. Lyrics plugin (`nd-lyrics`)
 
 Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
 
@@ -706,7 +795,7 @@ Worth changing from the defaults:
 
 ---
 
-### 10b. Libraries — never let two overlap
+### 11b. Libraries — never let two overlap
 
 Libraries in 0.63 are **rows in the DB**, not toml entries. `MusicFolder` only seeds a default library (id 1) on first run; after that the web UI is the source of truth. This box runs one library per genre folder under `/mnt/nvme/files/`, each granted to its own playback-only user, with the admin granted all of them.
 
@@ -735,11 +824,11 @@ Deleting the default library is safe: Navidrome did not recreate one on restart,
 
 ---
 
-## 11. ICY radio metadata loggers
+## 12. ICY radio metadata loggers
 
 Two systemd services scrape ICY stream metadata and append every track change to a `.txt` on the share.
 
-### 11a. The script
+### 12a. The script
 
 The repo is your fork, which carries a fix (`Fix permanent desync when metadata straddles a chunk boundary`) not in upstream:
 
@@ -753,7 +842,7 @@ git remote add upstream https://github.com/lucvanbraekel/icy-meta.git
 
 Needs `python3-requests` (installed in section 1).
 
-### 11b. Units
+### 12b. Units
 
 `/etc/systemd/system/icyscan-afrobeats.service`:
 
@@ -818,7 +907,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now icyscan-afrobeats icyscan-afrohouse
 ```
 
-> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 11c instead.
+> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 12c instead.
 
 **Why awk owns the file and not systemd:** `StandardOutput=append:` resolves the path once at start and binds to the *inode*. Finder replacing the file over SMB (unlink-then-create) left the service writing into an orphaned inode while the visible file stayed at 0 bytes — silently, nothing in the journal. `close(LOG)` after each line forces a path re-resolve, so a deleted log comes back within one song. **Any new station unit must use this pattern.**
 
@@ -826,7 +915,7 @@ Two known, expected behaviours: the script reconnects to the stream roughly once
 
 Logs land at `smb://192.168.8.191/mbogiservershare/icyscan/`.
 
-### 11c. 90s90s — `flowscan`, polling the iris feed
+### 12c. 90s90s — `flowscan`, polling the iris feed
 
 90s90s doesn't publish tracks over ICY (see the note above), but its web player does. The Nuxt bundles call an "iris" endpoint:
 
@@ -921,11 +1010,11 @@ sudo systemctl enable --now flowscan@261
 
 ---
 
-## 12. Tailscale remote access
+## 13. Tailscale remote access
 
 The LAN sits behind a GL.iNet router whose IPv4 egress is an M247 commercial-VPN range, on top of likely CGNAT — **there is no inbound path**, so port forwarding and DDNS are impossible. An outbound tunnel is the only option.
 
-### 12a. Install and join
+### 13a. Install and join
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -941,7 +1030,7 @@ Follow the printed URL and log in as `your-tailscale-account`. Then in the Tails
 
 Result: tailnet IP `YOUR_TAILNET_IP`, MagicDNS `raspberrypi.your-tailnet.ts.net`.
 
-### 12b. Persist IP forwarding
+### 13b. Persist IP forwarding
 
 ```bash
 printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
@@ -949,7 +1038,7 @@ printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 ```
 
-### 12c. UDP GRO tuning on the bridge
+### 13c. UDP GRO tuning on the bridge
 
 Throughput fix for subnet routing — needs to reapply on every boot, hence the oneshot unit.
 
@@ -990,7 +1079,7 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 
 ---
 
-## 13. Verification checklist
+## 14. Verification checklist
 
 ```bash
 # storage
@@ -1004,10 +1093,11 @@ systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 t
 ls /var/lib/navidrome/plugins                      # nd-lyrics.ndp
 
 # containers
-sudo pct list                                      # 100 + 101 + 102 + 103 + 104 running
+sudo pct list                                      # 100 + 101 + 102 + 103 + 104 + 105 running
 curl -s http://192.168.8.214:13378/status          # audiobookshelf, serverVersion 2.36.0
 curl -s http://192.168.8.215:32400/identity        # plex, version 1.43.3.10896
 curl -s http://192.168.8.216:8096/System/Info/Public   # emby, Version 4.9.5.0
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.8.217:8080/   # gopodder, 303 -> /setup
 
 # listening ports
 sudo ss -tlnp | grep -E ':(22|80|445|4533|8006|32400)'
@@ -1021,17 +1111,18 @@ tailscale status
 tailscale ip -4                                    # YOUR_TAILNET_IP
 ```
 
-Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `https://192.168.8.191:8006`.
+Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `http://192.168.8.217:8080`, `https://192.168.8.191:8006`.
 
 ---
 
-## 14. Things worth knowing before you rebuild
+## 15. Things worth knowing before you rebuild
 
 - **Back up first.** The music library under `/mnt/nvme/files` and the icyscan `.txt` history are the only irreplaceable data. Also grab `/etc/navidrome/navidrome.toml` (Last.fm keys), `/etc/pve/lxc/*.conf`, `/var/azuracast/.env`, and `/var/lib/navidrome/` (playlists, play counts, users).
 - **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
 - **No PVE backup jobs are configured.** `/etc/pve/jobs.cfg` is empty and both `dump/` directories are empty — nothing is being backed up automatically. Worth adding a vzdump job to `nvme` storage if you care about the containers.
 - **`zfsutils-linux` is installed** (pulled in by PXVIRT) but no pool exists and the module isn't loaded. Ignore it.
-- **nginx on :80 serves a hand-written "Home Server" landing page** (`/var/www/html/index.html`) — a dark card grid linking out to Music Assistant, Navidrome, Audiobookshelf, Plex and Emby. Nothing is *proxied* through nginx; the cards are plain absolute links to each service's own host and port, so adding a service means adding an `<a class="card">` block by hand. The stock Debian page is still there as `index.nginx-debian.html`.
+- **nginx on :80 serves the dashboard** — `/var/www/html/index.html`, a live status grid that polls `/api/status` every 5 seconds. That API is `hqdash`, a stdlib-Python service at `/opt/hqdash/hqdash.py` bound to `127.0.0.1:8787`; nginx proxies `/api/` to it and is what keeps it off the LAN. Every service it can see or control is an entry in the `TARGETS` dict at the top of that file, so **adding a container means editing `TARGETS` and `sudo systemctl restart hqdash`** — the page itself is entirely data-driven and needs no edit. `/opt/hqdash/README.md` documents it. It replaced a hand-written grid of static links, kept as `index.html.bak-pre-hqdash-20260901`; the stock Debian page is still there as `index.nginx-debian.html`.
+- **The dashboard has no authentication.** Anyone on the LAN or the tailnet can start, stop and restart every service on the box, and reboot the Pi. That is the same trust boundary as the Proxmox UI on :8006 and it holds only because :80 is not forwarded and the line is behind CGNAT. Put auth in front of it before exposing it to anything.
 - **`samba-ad-dc.service` is enabled** but the server is a standalone file server. Harmless.
 - **`postfix` is running** on localhost only, for PVE's mail notifications.
-- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–9) after PXVIRT. Everything else is independent.
+- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–10) after PXVIRT. Everything else is independent.

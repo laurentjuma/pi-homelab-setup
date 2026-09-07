@@ -17,14 +17,15 @@ Step-by-step notes for rebuilding a Raspberry Pi 5 homelab from a blank SD card,
 | 7 | CT 102 — Audiobookshelf |
 | 8 | CT 103 — Plex |
 | 9 | CT 104 — Emby |
-| 10 | Navidrome — plus the `nd-lyrics` plugin and why libraries must never overlap |
-| 11 | Radio track logging — ICY metadata scanners, plus `flowscan` for stations that don't publish over ICY |
-| 12 | Tailscale — subnet router, for a LAN behind CGNAT with no inbound path |
-| 13–14 | Verification checklist and rebuild gotchas |
+| 10 | CT 105 — goPodder, a gpodder.net-compatible podcast sync server |
+| 11 | Navidrome — plus the `nd-lyrics` plugin and why libraries must never overlap |
+| 12 | Radio track logging — ICY metadata scanners, plus `flowscan` for stations that don't publish over ICY |
+| 13 | Tailscale — subnet router, for a LAN behind CGNAT with no inbound path |
+| 14–15 | Verification checklist and rebuild gotchas |
 
 ## `flowscan.py`
 
-A small stdlib-only poller for stations whose ICY `StreamTitle` is just the station name. It reads the web player's own metadata API instead and appends each track change to a log. Covered in section 11c; runs as a systemd template unit where the instance name is the station ID.
+A small stdlib-only poller for stations whose ICY `StreamTitle` is just the station name. It reads the web player's own metadata API instead and appends each track change to a log. Covered in section 12c; runs as a systemd template unit where the instance name is the station ID.
 
 ## Placeholders
 

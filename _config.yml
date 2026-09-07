@@ -2,7 +2,7 @@ title: Raspberry Pi 5 Homelab
 description: A step-by-step rebuild guide — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, radio track logging, Tailscale.
 theme: jekyll-theme-cayman
 
-# flowscan.py is reference material for section 8c, not a page to render.
+# flowscan.py is reference material for section 12c, not a page to render.
 exclude:
   - flowscan.py
   - README.md
