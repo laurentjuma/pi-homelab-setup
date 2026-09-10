@@ -1,11 +1,11 @@
 ---
 title: Raspberry Pi 5 — Full Rebuild Guide
-description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, Plex, Emby, goPodder, radio track logging, Tailscale.
+description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, Audiobookshelf, Plex, Emby, goPodder, m3ugoat, radio track logging, Tailscale.
 ---
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-07 — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 15). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (11a), whole-disk library removed (11b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-10 — m3ugoat in CT 106 (section 11). **2026-09-07** — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 16). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (12a), whole-disk library removed (12b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -27,6 +27,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | CT 103 | Plex (Docker in LXC) | 192.168.8.215, web UI `:32400` |
 | CT 104 | Emby (Docker in LXC) | 192.168.8.216, web UI `:8096` |
 | CT 105 | goPodder (Docker in LXC) — podcast sync, gpodder.net API | 192.168.8.217, web UI `:8080` |
+| CT 106 | m3ugoat (Node + systemd in LXC, no Docker) — IPTV playlist/EPG manager | 192.168.8.218, web UI `:8080` |
 | Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
 | Radio logging | `icyscan-afrobeats`, `icyscan-afrohouse` (ICY), `flowscan@265` (90s90s API) | logs in `/mnt/nvme/files/icyscan/` |
 | Remote access | Tailscale + subnet router for 192.168.8.0/24 | `YOUR_TAILNET_IP` |
@@ -160,7 +161,7 @@ sudo systemctl enable smbd nmbd
 
 From the Mac: `smb://192.168.8.191/mbogiservershare` (user `youruser`).
 
-> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 12 — that's why the icyscan units don't use `append:`.
+> **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 13 — that's why the icyscan units don't use `append:`.
 
 ---
 
@@ -693,13 +694,154 @@ sudo pct exec 105 -- cp /opt/gopodder/data/gopodder.db /tmp/gopodder-$(date +%F)
 
 In the app this is the "gpodder.net sync" / "Synchronize subscriptions" setting with a custom server — `http://192.168.8.217:8080`, then the goPodder user's credentials.
 
-**AntennaPod requires HTTPS and goPodder does not terminate TLS**, so plain `http://` will not do for the phone. Desktop gPodder and Cardo accept HTTP and work as-is. The cheap fix for AntennaPod is the tailnet (section 13) — `tailscale cert` plus `tailscale serve` on the host gives a real certificate on a MagicDNS name with no port forwarding; nginx on :80 could also front it, but then you are minting certificates for a LAN name. Either way, do not reach for Funnel unless the phone genuinely has to sync from outside the tailnet: that publishes the login page to the internet.
+**AntennaPod requires HTTPS and goPodder does not terminate TLS**, so plain `http://` will not do for the phone. Desktop gPodder and Cardo accept HTTP and work as-is. The cheap fix for AntennaPod is the tailnet (section 14) — `tailscale cert` plus `tailscale serve` on the host gives a real certificate on a MagicDNS name with no port forwarding; nginx on :80 could also front it, but then you are minting certificates for a LAN name. Either way, do not reach for Funnel unless the phone genuinely has to sync from outside the tailnet: that publishes the login page to the internet.
 
 Finally, add a card for it to the dashboard — an entry in `TARGETS` in `/opt/hqdash/hqdash.py`, then `sudo systemctl restart hqdash`.
 
 ---
 
-## 11. Navidrome
+## 11. CT 106 — m3ugoat
+
+Unprivileged LXC, 2 cores / 2 GB, static 192.168.8.218, rootfs on the NVMe. Web UI on `:8080`.
+
+[m3ugoat](https://github.com/m3ugoat/m3ugoat-playlist-manager) is a self-hosted IPTV playlist and EPG manager — a fork of [m3u4me](https://github.com/andrei-savin/m3u4me) adding multi-user accounts, per-device sign-in and a documented sync API. It manages M3U playlists; it serves no streams and you bring your own content.
+
+**This is the one container here that does not run Docker.** There is no published image, and the app is a Node server plus a static frontend — wrapping that in a hand-rolled Dockerfile would add an image to rebuild on every update and buy nothing. It runs as a plain systemd unit instead, the same way Navidrome does on the host.
+
+> `:8080` again, the same port goPodder uses. Not a clash — each container has its own IP and its own network namespace, so `192.168.8.217:8080` and `192.168.8.218:8080` are unrelated. Nothing is published to the host.
+
+### 11a. The container
+
+```bash
+sudo pct create 106 local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst \
+  --hostname m3ugoat \
+  --arch arm64 --ostype debian \
+  --cores 2 --memory 2048 --swap 512 \
+  --rootfs nvme:12 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.8.218/24,gw=192.168.8.1,type=veth \
+  --nameserver "1.1.1.1 8.8.8.8" \
+  --unprivileged 1 \
+  --onboot 1
+
+sudo pct start 106
+```
+
+No `--features nesting=1` here, unlike CT 100–105: nesting is what lets Docker run inside an unprivileged container, and there is no Docker in this one. No media mount either — the app stores playlists, not files.
+
+2 GB is sized for `npm run build`, not for serving. Rollup is the peak and it is brief; the running server sits far below that.
+
+### 11b. Node 24
+
+The app needs **Node 24+** — it uses Node's built-in SQLite, and runs `server.ts` through Node's native TypeScript support with no build step for the server. Debian 13 ships 20.19, so this comes from NodeSource:
+
+```bash
+sudo pct enter 106
+
+apt update && apt install -y ca-certificates curl git
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt install -y nodejs
+
+node -v          # v24.21.0 — must be >= 24, apt's own nodejs is 20.19 and will not do
+```
+
+### 11c. The app
+
+It runs as its own unprivileged user rather than root, with the checkout under that user's home:
+
+```bash
+useradd --system --create-home --home-dir /opt/m3ugoat --shell /usr/sbin/nologin m3ugoat
+
+git clone https://github.com/m3ugoat/m3ugoat-playlist-manager.git /opt/m3ugoat/app
+chown -R m3ugoat:m3ugoat /opt/m3ugoat
+install -d -o m3ugoat -g m3ugoat /opt/m3ugoat/app/data
+
+runuser -u m3ugoat -- bash -c 'cd /opt/m3ugoat/app && npm ci && npm run build'
+```
+
+Run every `git` and `npm` command as `m3ugoat`, not as root. Cloning as root and then `chown`-ing leaves git refusing to touch the tree afterwards — *"detected dubious ownership in repository"* — because the working directory is no longer owned by the user running git.
+
+`npm run build` only builds the **frontend** into `dist/`. The server is not compiled; Node strips the types out of `server.ts` at load time.
+
+### 11d. The unit
+
+The rest of this box is supervised by systemd, so this is too. The project ships an `ecosystem.config.cjs` and its README installs PM2 — PM2 would be a second supervisor whose `pm2 startup` generates a systemd unit to launch it anyway.
+
+```ini
+# /etc/systemd/system/m3ugoat.service
+[Unit]
+Description=m3ugoat - self-hosted M3U playlist manager and sync API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m3ugoat
+Group=m3ugoat
+WorkingDirectory=/opt/m3ugoat/app
+Environment=NODE_ENV=production
+Environment=PORT=8080
+# server.ts is run directly - Node 24 strips the types itself, no build step for the server.
+ExecStart=/usr/bin/node server.ts
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# It only ever reads its own tree and writes the SQLite file under data/.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/m3ugoat/app/data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now m3ugoat
+exit
+```
+
+`WorkingDirectory` is load-bearing: the app resolves its data directory as `<cwd>/data`, so a different working directory silently gives you a different, empty database. `ProtectSystem=strict` makes the whole filesystem read-only apart from `ReadWritePaths`, which is why `data/` has to exist before first start — the app would otherwise try to `mkdir` it into a read-only tree.
+
+Check it without a browser:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.8.218:8080/   # 200
+curl -s http://192.168.8.218:8080/api/auth/status
+# {"enabled":false,"userCount":0,"multiUser":false}
+```
+
+> **`"enabled":false` means the API has no authentication at all** — that is the documented default for a fresh install, and it makes every `/api/*` route open to anyone who can reach the port. Playlists routinely embed provider credentials in stream URLs. **Set a password in the UI before adding anything real.**
+
+Note also that the fork **disables the old numeric playlist URLs** (`/1`, `/2`, …) and returns `410 Gone`: they are unauthenticated and sequential, so anyone on the LAN could walk them and read every account's playlists. Use the `/e/<token>` links from the Export dialog. `ALLOW_INSECURE_SHORT_IDS=1` brings the old ones back if you are mid-migration from upstream.
+
+### 11e. Updating and backup
+
+```bash
+sudo pct exec 106 -- runuser -u m3ugoat -- bash -c \
+  'cd /opt/m3ugoat/app && git pull --ff-only && npm ci && npm run build'
+sudo pct exec 106 -- systemctl restart m3ugoat
+```
+
+If `git pull` complains that `package-lock.json` would be overwritten, `git restore package-lock.json` first — `npm ci` rewrites it in place.
+
+The database is one SQLite file in WAL mode, safe to copy while the server runs:
+
+```bash
+sudo pct exec 106 -- cp /opt/m3ugoat/app/data/m3ugoat.db /tmp/m3ugoat-$(date +%F).db
+```
+
+Finally, add a card for it to the dashboard — an entry in `TARGETS` in `/opt/hqdash/hqdash.py`, then `sudo systemctl restart hqdash`.
+
+---
+
+## 12. Navidrome
 
 Installed from the official `.deb` (not from a repo — `apt-cache policy` shows it as local-only), running on the **host**, not in a container.
 
@@ -716,7 +858,7 @@ Config at `/etc/navidrome/navidrome.toml`:
 
 ```toml
 DataFolder = "/var/lib/navidrome"
-MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 11b
+MusicFolder = "/var/lib/navidrome/no-music"   # empty on purpose — see 12b
 LyricsPriority = ".ttml,.yaml,.yml,.elrc,.lrc,.srt,nd-lyrics,.txt,embedded"
 
 [LastFM]
@@ -746,7 +888,7 @@ Two notes on the current state:
 - `MusicFolder` points at an empty directory on purpose — libraries live in the DB, not the config. Pointing it at `/mnt/nvme` is what caused the duplicate-indexing problem in 7b, so don't put it back.
 - `/opt/navidrome/music` exists, owned by `navidrome` — vestigial from an earlier install-script attempt. Harmless, and not needed on a rebuild.
 
-### 11a. Lyrics plugin (`nd-lyrics`)
+### 12a. Lyrics plugin (`nd-lyrics`)
 
 Navidrome has a plugin system as of v0.63 (`Plugins.Enabled`, on by default). Plugins are single `.ndp` bundles read from `<DataFolder>/plugins`. [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) fetches lyrics from online providers on demand.
 
@@ -795,7 +937,7 @@ Worth changing from the defaults:
 
 ---
 
-### 11b. Libraries — never let two overlap
+### 12b. Libraries — never let two overlap
 
 Libraries in 0.63 are **rows in the DB**, not toml entries. `MusicFolder` only seeds a default library (id 1) on first run; after that the web UI is the source of truth. This box runs one library per genre folder under `/mnt/nvme/files/`, each granted to its own playback-only user, with the admin granted all of them.
 
@@ -824,11 +966,11 @@ Deleting the default library is safe: Navidrome did not recreate one on restart,
 
 ---
 
-## 12. ICY radio metadata loggers
+## 13. ICY radio metadata loggers
 
 Two systemd services scrape ICY stream metadata and append every track change to a `.txt` on the share.
 
-### 12a. The script
+### 13a. The script
 
 The repo is your fork, which carries a fix (`Fix permanent desync when metadata straddles a chunk boundary`) not in upstream:
 
@@ -842,7 +984,7 @@ git remote add upstream https://github.com/lucvanbraekel/icy-meta.git
 
 Needs `python3-requests` (installed in section 1).
 
-### 12b. Units
+### 13b. Units
 
 `/etc/systemd/system/icyscan-afrobeats.service`:
 
@@ -907,7 +1049,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now icyscan-afrobeats icyscan-afrohouse
 ```
 
-> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 12c instead.
+> **90s90s is not on ICY.** An `icyscan-90shiphop.service` briefly existed and was removed on 2026-08-08. The 90s90s streams do send `icy-metaint: 8192`, so the scanner connects and looks healthy, but `StreamTitle` is the static station name (`90s90s - HipHop`) rather than per-track data — same on the `mp3-192`, `mp3-128` and `aac-64` variants. **A valid `icy-metaint` header is not evidence a station publishes track metadata; check that `StreamTitle` actually changes before adding any station.** 90s90s is handled by section 13c instead.
 
 **Why awk owns the file and not systemd:** `StandardOutput=append:` resolves the path once at start and binds to the *inode*. Finder replacing the file over SMB (unlink-then-create) left the service writing into an orphaned inode while the visible file stayed at 0 bytes — silently, nothing in the journal. `close(LOG)` after each line forces a path re-resolve, so a deleted log comes back within one song. **Any new station unit must use this pattern.**
 
@@ -915,7 +1057,7 @@ Two known, expected behaviours: the script reconnects to the stream roughly once
 
 Logs land at `smb://192.168.8.191/mbogiservershare/icyscan/`.
 
-### 12c. 90s90s — `flowscan`, polling the iris feed
+### 13c. 90s90s — `flowscan`, polling the iris feed
 
 90s90s doesn't publish tracks over ICY (see the note above), but its web player does. The Nuxt bundles call an "iris" endpoint:
 
@@ -1010,11 +1152,11 @@ sudo systemctl enable --now flowscan@261
 
 ---
 
-## 13. Tailscale remote access
+## 14. Tailscale remote access
 
 The LAN sits behind a GL.iNet router whose IPv4 egress is an M247 commercial-VPN range, on top of likely CGNAT — **there is no inbound path**, so port forwarding and DDNS are impossible. An outbound tunnel is the only option.
 
-### 13a. Install and join
+### 14a. Install and join
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -1030,7 +1172,7 @@ Follow the printed URL and log in as `your-tailscale-account`. Then in the Tails
 
 Result: tailnet IP `YOUR_TAILNET_IP`, MagicDNS `raspberrypi.your-tailnet.ts.net`.
 
-### 13b. Persist IP forwarding
+### 14b. Persist IP forwarding
 
 ```bash
 printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
@@ -1038,7 +1180,7 @@ printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
 sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
 ```
 
-### 13c. UDP GRO tuning on the bridge
+### 14c. UDP GRO tuning on the bridge
 
 Throughput fix for subnet routing — needs to reapply on every boot, hence the oneshot unit.
 
@@ -1064,7 +1206,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tailscale-gro
 ```
 
-### 12d. Using it
+### 13d. Using it
 
 Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, WireGuard already encrypts it:
 
@@ -1079,7 +1221,7 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 
 ---
 
-## 14. Verification checklist
+## 15. Verification checklist
 
 ```bash
 # storage
@@ -1093,11 +1235,12 @@ systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 t
 ls /var/lib/navidrome/plugins                      # nd-lyrics.ndp
 
 # containers
-sudo pct list                                      # 100 + 101 + 102 + 103 + 104 + 105 running
+sudo pct list                                      # 100 + 101 + 102 + 103 + 104 + 105 + 106 running
 curl -s http://192.168.8.214:13378/status          # audiobookshelf, serverVersion 2.36.0
 curl -s http://192.168.8.215:32400/identity        # plex, version 1.43.3.10896
 curl -s http://192.168.8.216:8096/System/Info/Public   # emby, Version 4.9.5.0
 curl -s -o /dev/null -w '%{http_code}\n' http://192.168.8.217:8080/   # gopodder, 303 -> /setup
+curl -s http://192.168.8.218:8080/api/auth/status      # m3ugoat, {"enabled":true,...}
 
 # listening ports
 sudo ss -tlnp | grep -E ':(22|80|445|4533|8006|32400)'
@@ -1111,11 +1254,11 @@ tailscale status
 tailscale ip -4                                    # YOUR_TAILNET_IP
 ```
 
-Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `http://192.168.8.217:8080`, `https://192.168.8.191:8006`.
+Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `http://192.168.8.217:8080`, `http://192.168.8.218:8080`, `https://192.168.8.191:8006`.
 
 ---
 
-## 15. Things worth knowing before you rebuild
+## 16. Things worth knowing before you rebuild
 
 - **Back up first.** The music library under `/mnt/nvme/files` and the icyscan `.txt` history are the only irreplaceable data. Also grab `/etc/navidrome/navidrome.toml` (Last.fm keys), `/etc/pve/lxc/*.conf`, `/var/azuracast/.env`, and `/var/lib/navidrome/` (playlists, play counts, users).
 - **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
@@ -1125,4 +1268,4 @@ Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191
 - **The dashboard has no authentication.** Anyone on the LAN or the tailnet can start, stop and restart every service on the box, and reboot the Pi. That is the same trust boundary as the Proxmox UI on :8006 and it holds only because :80 is not forwarded and the line is behind CGNAT. Put auth in front of it before exposing it to anything.
 - **`samba-ad-dc.service` is enabled** but the server is a standalone file server. Harmless.
 - **`postfix` is running** on localhost only, for PVE's mail notifications.
-- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–10) after PXVIRT. Everything else is independent.
+- **Order matters** in one place: PXVIRT (section 4) must come after the `vmbr0` bridge exists, and the containers (5–11) after PXVIRT. Everything else is independent.
