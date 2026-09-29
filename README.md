@@ -19,14 +19,23 @@ Step-by-step notes for rebuilding a Raspberry Pi 5 homelab from a blank SD card,
 | 9 | CT 104 — Emby |
 | 10 | CT 105 — goPodder, a gpodder.net-compatible podcast sync server |
 | 11 | CT 106 — m3ugoat, an IPTV playlist/EPG manager; the one container with no Docker |
-| 12 | Navidrome — plus the `nd-lyrics` plugin and why libraries must never overlap |
-| 13 | Radio track logging — ICY metadata scanners, plus `flowscan` for stations that don't publish over ICY |
-| 14 | Tailscale — subnet router, for a LAN behind CGNAT with no inbound path |
-| 15–16 | Verification checklist and rebuild gotchas |
+| 12 | CT 107 — the *arr stack: qBittorrent, Prowlarr, Sonarr, Radarr, Bazarr, Recyclarr, hardlinked off one `/data` root |
+| 13 | CT 108 — Jellyfin |
+| 14 | CT 109 — Kodi, headless under Xvfb, serving music, movies and TV over JSON-RPC to Symfonium/Yatse/Kore |
+| 15 | Navidrome — plus the `nd-lyrics` plugin and why libraries must never overlap |
+| 16 | Radio track logging — ICY metadata scanners, plus `flowscan` for stations that don't publish over ICY |
+| 17 | Tailscale — subnet router, for a LAN behind CGNAT with no inbound path |
+| 18–19 | Verification checklist and rebuild gotchas |
 
 ## `flowscan.py`
 
-A small stdlib-only poller for stations whose ICY `StreamTitle` is just the station name. It reads the web player's own metadata API instead and appends each track change to a log. Covered in section 13c; runs as a systemd template unit where the instance name is the station ID.
+A small stdlib-only poller for stations whose ICY `StreamTitle` is just the station name. It reads the web player's own metadata API instead and appends each track change to a log. Covered in section 16c; runs as a systemd template unit where the instance name is the station ID.
+
+## `arr-wire.py`
+
+Wires the CT 107 stack together over the apps' own APIs — root folders, qBittorrent as the download client in Sonarr and Radarr, and both of them registered in Prowlarr. Covered in section 12e; run it inside CT 107 with `QB_PASSWORD` set. Every step checks before it creates, so it is safe to re-run after a rebuild.
+
+Indexers are deliberately left out: add those in Prowlarr, and Full Sync pushes them down on its own.
 
 ## Placeholders
 

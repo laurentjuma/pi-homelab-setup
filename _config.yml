@@ -1,9 +1,10 @@
 title: Raspberry Pi 5 Homelab
-description: A step-by-step rebuild guide — NVMe/LVM, Samba, Proxmox on ARM64, LXC, Navidrome, radio track logging, Tailscale.
+description: A step-by-step rebuild guide — NVMe/LVM, Samba, Proxmox on ARM64, LXC, the *arr stack, Jellyfin, headless Kodi, Navidrome, radio track logging, Tailscale.
 theme: jekyll-theme-cayman
 
-# flowscan.py is reference material for section 13c, not a page to render.
+# flowscan.py (16c) and arr-wire.py (12e) are reference material, not pages to render.
 exclude:
   - flowscan.py
+  - arr-wire.py
   - README.md
   - "*.local.md"        # private un-sanitized copies — never render
