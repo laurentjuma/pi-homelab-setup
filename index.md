@@ -5,7 +5,7 @@ description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba,
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-10 — m3ugoat in CT 106 (section 11). **2026-09-07** — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 16). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (12a), whole-disk library removed (12b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-29 — read-only WebDAV of the share on `:8081` (3a), and Samba no longer lets Macs write `._*`/`.DS_Store` files (3). **2026-09-10** — m3ugoat in CT 106 (section 11). **2026-09-07** — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 16). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (12a), whole-disk library removed (12b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -19,7 +19,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 |---|---|---|
 | OS | Raspberry Pi OS / Debian 13 trixie, kernel 6.12 rpi-2712 | SD card `mmcblk0`, 119 GB |
 | Storage | 931 GB NVMe → LVM → ext4 | `/mnt/nvme` |
-| File sharing | Samba share `mbogiservershare` | `/mnt/nvme/files` |
+| File sharing | Samba share `mbogiservershare`; the same tree read-only over WebDAV | `/mnt/nvme/files`, WebDAV `:8081` |
 | Hypervisor | PXVIRT (Proxmox VE 9.0 ARM64 port) | web UI `:8006` |
 | CT 100 | Music Assistant (Docker in LXC) | 192.168.8.213 |
 | CT 101 | AzuraCast (Docker in LXC) — **installed, not running** | 192.168.8.192 |
@@ -149,6 +149,27 @@ path = /mnt/nvme/files
 writeable = yes
 browseable = yes
 public = no
+veto files = /._*/.DS_Store/
+delete veto files = yes
+```
+
+And at the top of `[global]`:
+
+```ini
+vfs objects = catia fruit streams_xattr
+fruit:metadata = stream
+fruit:resource = xattr
+```
+
+**Why:** without `vfs_fruit`, every Mac that copies a file in leaves a `._<name>` AppleDouble twin beside it, plus a `.DS_Store` in every folder it opens. By 2026-09-29 the share had 16,302 of them, nearly all in the music folders, where they turn up as fake `._track.mp3` entries in anything that doesn't skip dotfiles. `fruit` + `streams_xattr` store the same Finder metadata in ext4 xattrs instead, and `veto files` refuses the files outright, even from a Mac that tries anyway. `delete veto files` stops those files from making a folder undeletable. `fruit` goes in `[global]`, not the share: `testparm` warns that a Mac mounting a mix of fruit and non-fruit shares (the stock `[homes]` counts) is undefined behaviour.
+
+Clearing out an existing crop, with a tar kept in case: check the `._*` files really are AppleDouble first (header `00 05 16 07`), then:
+
+```bash
+cd /mnt/nvme/files
+sudo find . -type f \( -name '._*' -o -name .DS_Store \) -print0 > /tmp/macjunk.list
+sudo tar --null -T /tmp/macjunk.list -cf /mnt/nvme/mac-metadata-$(date +%Y%m%d).tar
+sudo xargs -0 rm -f -- < /tmp/macjunk.list
 ```
 
 Set the Samba password for your Unix user, then restart:
@@ -162,6 +183,91 @@ sudo systemctl enable smbd nmbd
 From the Mac: `smb://192.168.8.191/mbogiservershare` (user `youruser`).
 
 > **Gotcha to remember:** anything systemd writes here with `StandardOutput=append:` is created as root even when the unit has `User=`, so it won't be writable over the share. See section 13 — that's why the icyscan units don't use `append:`.
+
+### 3a. Read-only WebDAV on `:8081`
+
+The same tree over HTTP, for clients that don't speak SMB: phone file managers, media players that browse WebDAV, and anything connecting over the tailnet. It is **read-only by design**. Samba stays the only way to write to the share, so a misbehaving WebDAV client can't rename or delete anything in the music library.
+
+It runs as `rclone serve webdav` on the host, not in a container. Because it runs as `youruser`, it reads the tree exactly as Samba does, with no bind mount and no uid mapping.
+
+```bash
+sudo apt install -y rclone apache2-utils        # Debian's rclone 1.60 is fine for this
+```
+
+One user with a bcrypt hash, in a file only `youruser` can read. The password is kept in root's home:
+
+```bash
+sudo install -d -m 0750 -o root -g youruser /etc/webdav
+PW=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
+echo "$PW" | sudo tee /root/webdav-password >/dev/null && sudo chmod 600 /root/webdav-password
+sudo htpasswd -cbB /etc/webdav/htpasswd youruser "$PW"
+sudo chown root:youruser /etc/webdav/htpasswd && sudo chmod 640 /etc/webdav/htpasswd
+```
+
+`/etc/systemd/system/webdav.service`:
+
+```ini
+[Unit]
+Description=WebDAV (read-only) of /mnt/nvme/files via rclone
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/nvme/files
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+ExecStart=/usr/bin/rclone serve webdav /mnt/nvme/files \
+  --addr :8081 \
+  --read-only \
+  --htpasswd /etc/webdav/htpasswd \
+  --realm mbogiservershare \
+  --exclude ._* --exclude .DS_Store \
+  --dir-cache-time 30s \
+  --log-level NOTICE
+Restart=always
+RestartSec=10
+
+# Hardening: read-only share, so it needs no write access anywhere.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+Environment=RCLONE_CONFIG=/dev/null
+Environment=XDG_CACHE_HOME=/tmp
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now webdav
+```
+
+`RCLONE_CONFIG=/dev/null`: serving a local path needs no remotes, and without this rclone goes looking for `~/.config/rclone`, which `ProtectHome=yes` hides. `--dir-cache-time 30s` makes a file dropped in over SMB appear in a WebDAV listing within half a minute. The default is five minutes, and a five-minute delay looks like a bug.
+
+The two `--exclude`s hide the `._*` AppleDouble and `.DS_Store` files that Macs leave behind over SMB, so they don't clutter listings or turn up as fake `._track.mp3` entries in players that browse WebDAV.
+
+Check it. The unauthenticated request must be refused, and so must any write:
+
+```bash
+PW=$(sudo cat /root/webdav-password); U=http://192.168.8.191:8081
+curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND $U/                               # 401
+curl -s -o /dev/null -w '%{http_code}\n' -u youruser:$PW -X PROPFIND -H 'Depth: 1' $U/  # 207
+curl -s -o /dev/null -w '%{http_code}\n' -u youruser:$PW -T /etc/hostname $U/x.txt       # 404 - refused
+curl -s -o /dev/null -w '%{http_code}\n' -u youruser:$PW -X DELETE $U/icyscan/90shiphop.txt  # 405 - refused
+```
+
+rclone 1.60 answers a refused `PUT` with `404`, not `403`. It looks wrong, but nothing is written, and `DELETE` gets a `405`.
+
+**Clients.** In Finder, choose *Go → Connect to Server*, enter `http://192.168.8.191:8081`, log in as `youruser` and use the password from `/root/webdav-password`. Over the tailnet the address is `http://YOUR_TAILNET_IP:8081`. Plain HTTP with Basic auth is acceptable on the LAN and inside WireGuard, but **don't forward :8081 anywhere**. Windows' built-in client refuses Basic auth over HTTP unless `HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters\BasicAuthLevel` is set to `2`, so use a third-party client there.
+
+It has a card on the dashboard (16) under *Host services*, from the entry `"webdav": {"kind": "unit", "unit": "webdav.service", ...}` in hqdash's `TARGETS`.
 
 ---
 
@@ -1216,6 +1322,7 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 - Music Assistant — `http://192.168.8.213:8095` (via the subnet route)
 - Plex — `http://192.168.8.215:32400/web` (via the subnet route)
 - Emby — `http://192.168.8.216:8096` (via the subnet route)
+- WebDAV — `http://YOUR_TAILNET_IP:8081`, read-only (3a)
 
 `tailscale netcheck` reports `MappingVariesByDestIP: true` (symmetric NAT), so connections often relay through the London DERP rather than going peer-to-peer. Fine for audio; expect less headroom for 4K video.
 
@@ -1228,7 +1335,7 @@ Reach services at the tailnet IP instead of the LAN IP — plain HTTP is fine, W
 df -h /mnt/nvme                                    # ~916G, ext4
 
 # services
-systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 tailscaled smbd
+systemctl is-active navidrome icyscan-afrobeats icyscan-afrohouse flowscan@265 tailscaled smbd webdav
 
 # navidrome + plugin
 /usr/bin/navidrome --version                       # 0.63.2

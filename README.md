@@ -10,7 +10,7 @@ Step-by-step notes for rebuilding a Raspberry Pi 5 homelab from a blank SD card,
 |---|---|
 | 1 | Base OS — Raspberry Pi OS / Debian 13 trixie, SSH keys, passwordless sudo |
 | 2 | NVMe — PCIe Gen 3, EEPROM boot order, partition → LVM → ext4 → `/mnt/nvme` |
-| 3 | Samba file share |
+| 3 | Samba file share, plus the same tree read-only over WebDAV (`rclone serve webdav`, `:8081`) |
 | 4 | PXVIRT — the Lierfang ARM64 port of Proxmox VE 9 (upstream has no arm64 build) |
 | 5 | CT 100 — Music Assistant in Docker, with the library bind-mounted read-only |
 | 6 | CT 101 — AzuraCast |
