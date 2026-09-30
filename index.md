@@ -1579,7 +1579,23 @@ kodi-rpc VideoLibrary.GetTVShows '{"properties":["year","episode"]}'
 # "Lioness" 2023 (1 ep), "The Polygamist" 2026 (4 eps)
 ```
 
-**New imports don't appear on their own.** `videolibrary.updateonstartup` is off by default, and nothing tells Kodi when Radarr or Sonarr drop a file. Either run `kodi-rpc VideoLibrary.Scan` after imports, or add a *Kodi* connection in Radarr and Sonarr (*Settings → Connect → Kodi*, host `192.168.8.221`, port `8080`, user `kodi`, *Update Library* on) so each import triggers a scan.
+**New imports don't appear on their own.** `videolibrary.updateonstartup` is off by default, and nothing tells Kodi when Radarr or Sonarr drop a file. So both of them get a *Kodi* connection (*Settings → Connect → + → Kodi*):
+
+| Field | Value |
+|---|---|
+| Name | `Kodi (CT 109)` |
+| Host / Port | `192.168.8.221` / `8080`, URL base `/jsonrpc` |
+| Username / Password | `kodi` / the contents of `/root/kodi-webserver-password` in CT 109 |
+| GUI Notification | off (there's no screen) |
+| Update Library | on |
+| Clean Library | on (deletes and upgrades drop the stale entry) |
+| Always Update | on (skip the "is something playing?" check) |
+| Triggers, Sonarr | On Import, On Upgrade, On Rename, On Series Delete, On Episode File Delete |
+| Triggers, Radarr | On Import, On Upgrade, On Rename, On Movie Delete, On Movie File Delete |
+
+*Test* must pass before *Save*. The *arrs see the library as `/data/...` and Kodi as `/media/files/...`, and that mismatch doesn't matter: for a show or movie Kodi already has, they look it up in Kodi's library (by id, or title for shows) and scan Kodi's own path for it, and for anything new they fall back to a full `VideoLibrary.Scan`.
+
+Sonarr's *On Import Complete* is left off on purpose. It fires once per batch on top of *On Import* per episode, so a season pack would trigger two scans.
 
 ### 14g. Pointing clients at it
 
