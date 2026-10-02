@@ -19,7 +19,7 @@ Step-by-step notes for rebuilding a Raspberry Pi 5 homelab from a blank SD card,
 | 9 | CT 104 — Emby |
 | 10 | CT 105 — goPodder, a gpodder.net-compatible podcast sync server |
 | 11 | CT 106 — m3ugoat, an IPTV playlist/EPG manager; the one container with no Docker |
-| 12 | CT 107 — the *arr stack: qBittorrent, Prowlarr, Sonarr, Radarr, Bazarr, Recyclarr, hardlinked off one `/data` root |
+| 12 | CT 107 — the *arr stack: qBittorrent, Prowlarr, Sonarr, Radarr, Bazarr, Recyclarr, hardlinked off one `/data` root, plus Seerr for requests |
 | 13 | CT 108 — Jellyfin |
 | 14 | CT 109 — Kodi, headless under Xvfb, serving music, movies and TV over JSON-RPC to Symfonium/Yatse/Kore |
 | 15 | Navidrome — plus the `nd-lyrics` plugin and why libraries must never overlap |
@@ -36,6 +36,10 @@ A small stdlib-only poller for stations whose ICY `StreamTitle` is just the stat
 Wires the CT 107 stack together over the apps' own APIs — root folders, qBittorrent as the download client in Sonarr and Radarr, and both of them registered in Prowlarr. Covered in section 12e; run it inside CT 107 with `QB_PASSWORD` set. Every step checks before it creates, so it is safe to re-run after a rebuild.
 
 Indexers are deliberately left out: add those in Prowlarr, and Full Sync pushes them down on its own.
+
+## `seerr-wire.py`
+
+Registers Radarr and Sonarr in Seerr with the Recyclarr profiles and the `/data` root folders, after the first-run wizard has signed in to Jellyfin. Covered in section 12h; run it inside CT 107. Seerr tests each connection before it's saved, and an app that's already set up is left alone. `--dry` prints what it would create.
 
 ## Placeholders
 

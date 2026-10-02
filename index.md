@@ -5,7 +5,7 @@ description: Rebuilding a Pi 5 homelab from a blank SD card — NVMe/LVM, Samba,
 
 Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the order you'd need to rebuild it from a blank SD card. Each section is standalone — skip any service you don't want.
 
-**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-09-29 — read-only WebDAV of the share on `:8081` (3a), and Samba no longer lets Macs write `._*`/`.DS_Store` files (3); Kodi, headless, in CT 109 (section 14); sections 14–18 renumbered to 15–19. **2026-09-22** — the *arr stack in CT 107 (section 12) and Jellyfin in CT 108 (section 13); sections 12–16 renumbered to 14–18 to keep the container sections contiguous. **2026-09-10** — m3ugoat in CT 106 (section 11). **2026-09-07** — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 19). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (15a), whole-disk library removed (15b).
+**Captured:** 2026-08-08 from the live machine. **Updated:** 2026-10-02 — Seerr for requests, in the CT 107 stack (12h). **2026-09-29** — read-only WebDAV of the share on `:8081` (3a), and Samba no longer lets Macs write `._*`/`.DS_Store` files (3); Kodi, headless, in CT 109 (section 14); sections 14–18 renumbered to 15–19. **2026-09-22** — the *arr stack in CT 107 (section 12) and Jellyfin in CT 108 (section 13); sections 12–16 renumbered to 14–18 to keep the container sections contiguous. **2026-09-10** — m3ugoat in CT 106 (section 11). **2026-09-07** — goPodder in CT 105 (section 10), dashboard now `hqdash` (section 19). **2026-08-28** — Emby in CT 104 (section 9), Plex in CT 103 (section 8). **2026-08-24** — Audiobookshelf in CT 102 (section 7). **2026-08-22** — Navidrome 0.63.2 + lyrics plugin (15a), whole-disk library removed (15b).
 
 > **Placeholders.** A few values are specific to my setup and have been replaced so this is safe to publish. Substitute your own:
 > `youruser` (the Linux/Samba account, uid 1000) · `YOUR_TAILNET_IP` (Tailscale 100.x address) · `your-tailnet` (tailnet name in the MagicDNS host) · `your-tailscale-account` (the account you log the node in as).
@@ -28,7 +28,7 @@ Everything running on a Raspberry Pi 5 (`raspberrypi`, 192.168.8.191), in the or
 | CT 104 | Emby (Docker in LXC) | 192.168.8.216, web UI `:8096` |
 | CT 105 | goPodder (Docker in LXC) — podcast sync, gpodder.net API | 192.168.8.217, web UI `:8080` |
 | CT 106 | m3ugoat (Node + systemd in LXC, no Docker) — IPTV playlist/EPG manager | 192.168.8.218, web UI `:8080` |
-| CT 107 | *arr stack (Docker Compose in LXC) — qBittorrent, Prowlarr, Sonarr, Radarr, Bazarr, Recyclarr | 192.168.8.219, web UIs `:8080` `:9696` `:8989` `:7878` `:6767` |
+| CT 107 | *arr stack (Docker Compose in LXC) — qBittorrent, Prowlarr, Sonarr, Radarr, Bazarr, Recyclarr, Seerr | 192.168.8.219, web UIs `:8080` `:9696` `:8989` `:7878` `:6767` `:5055` |
 | CT 108 | Jellyfin (Docker in LXC) | 192.168.8.220, web UI `:8096` |
 | CT 109 | Kodi (headless, Xvfb + systemd in LXC, no Docker) — music, movies and TV over JSON-RPC | 192.168.8.221, web server `:8080` |
 | Music server | Navidrome 0.63.2 + `nd-lyrics` plugin | `:4533` |
@@ -1264,7 +1264,7 @@ Set a permanent one via `/api/v2/app/setPreferences` (`web_ui_password`) or the 
 
 > **The session cookie is not called `SID`.** qBittorrent 5.x renamed it to `QBT_SID_<port>` — `QBT_SID_8080` here. Any script that greps the login response for `SID=` gets nothing and reports a login failure that looks like wrong credentials. Use curl's cookie jar (`-c`/`-b`) and the name stops mattering.
 
-On the `Home Server` landing page these get **six separate cards**, not one. `hqdash` originally understood only whole containers and host units, so a Compose stack collapsed into a single entry; it now has a `docker` kind that addresses one service inside an LXC:
+On the `Home Server` landing page these get **separate cards**, seven with Seerr (12h),, not one. `hqdash` originally understood only whole containers and host units, so a Compose stack collapsed into a single entry; it now has a `docker` kind that addresses one service inside an LXC:
 
 ```python
 "sonarr": {"kind": "docker", "vmid": "107", "container": "sonarr",
@@ -1272,7 +1272,73 @@ On the `Home Server` landing page these get **six separate cards**, not one. `hq
            "url": "http://192.168.8.219:8989", "note": "192.168.8.219:8989 - TV"},
 ```
 
-Start/stop/restart then act on that service alone, leaving the other five and the LXC running. Status is read from the container's cgroup under `/sys/fs/cgroup/lxc/107/ns/system.slice/docker-<id>.scope`, which is free; only the id→name mapping needs `pct exec`, and that is cached until the set of running ids changes — the same trade `lxc_state` makes to avoid `pct status`.
+Start/stop/restart then act on that service alone, leaving the rest of the stack and the LXC running. Status is read from the container's cgroup under `/sys/fs/cgroup/lxc/107/ns/system.slice/docker-<id>.scope`, which is free; only the id→name mapping needs `pct exec`, and that is cached until the set of running ids changes — the same trade `lxc_state` makes to avoid `pct status`.
+
+### 12h. Seerr — requests
+
+[Seerr](https://github.com/seerr-team/seerr) is the request front end, where Overseerr and Jellyseerr merged. Someone searches for a film or show, clicks *Request*, and Seerr hands it to Radarr or Sonarr with the right profile and folder. It signs people in with their Jellyfin (13) accounts and reads the Jellyfin library, so anything already downloaded shows as *Available* instead of being requested twice.
+
+It is one more service in the same Compose file, appended after `recyclarr`:
+
+```yaml
+  seerr:
+    <<: *common
+    # Request front end (Overseerr + Jellyseerr, merged). Talks to Sonarr and
+    # Radarr over arrnet by name, and to the media server on the LAN.
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true                        # Node as PID 1 does not reap or forward signals
+    environment:
+      TZ: Europe/London               # not PUID/PGID: the image runs as node (uid 1000)
+      LOG_LEVEL: info
+    ports: [5055:5055]
+    volumes:
+      - /opt/arr/seerr:/app/config    # owned by uid 1000 to match
+```
+
+```bash
+install -d -o 1000 -g 1000 /opt/arr/seerr
+cd /opt/arr && docker compose up -d seerr
+curl -s http://127.0.0.1:5055/api/v1/status
+# {"version":"3.5.0",...}
+```
+
+It's the only service here that doesn't take `PUID`/`PGID`. Unlike the linuxserver images it never starts as root, so the config directory has to belong to uid 1000 from the start, or the first write fails. It needs no `/data` mount: Seerr only ever talks to the other apps' APIs.
+
+**The first-run wizard has to be done in a browser**, because step one is signing in to the media server as its admin. Open `http://192.168.8.219:5055`, then:
+
+1. Choose **Jellyfin**: host `192.168.8.220`, port `8096`, no SSL, empty URL base, and the Jellyfin admin's username and password.
+2. Click **Sync Libraries** and tick **Movies** and **Shows**.
+3. On **Configure Services**, click **Finish Setup** with nothing added.
+
+Radarr and Sonarr then go in over the API. That's `seerr-wire.py` in this repo, run inside CT 107. It reads Seerr's key from `/opt/arr/seerr/settings.json` and the *arrs' from their `config.xml`s, and makes Seerr test each connection before saving it. It skips any app that's already set up, so it's safe to re-run:
+
+```bash
+pct push 107 seerr-wire.py /root/seerr-wire.py
+pct exec 107 -- python3 /root/seerr-wire.py --dry   # shows what it would create
+pct exec 107 -- python3 /root/seerr-wire.py
+```
+
+| | Radarr | Sonarr |
+|---|---|---|
+| Host | `radarr:7878` (by name, over `arrnet`) | `sonarr:8989` |
+| Profile | `HD Bluray + WEB` (Recyclarr, 12f) | `WEB-1080p` (Recyclarr), anime too |
+| Root folder | `/data/movies` | `/data/tv`, season folders on |
+| Other | minimum availability *Released*; default server; not 4K | series type *Standard*; default server; not 4K |
+| External URL | `http://192.168.8.219:7878` | `http://192.168.8.219:8989` |
+
+Seerr reaches the *arrs by service name because it's on `arrnet` with them. *External URL* is only for the links in Seerr's UI, so that one is the LAN address. To check it without starting a download, run the sync jobs and look up something that's already in the library, inside CT 107:
+
+```bash
+K=$(python3 -c 'import json;print(json.load(open("/opt/arr/seerr/settings.json"))["main"]["apiKey"])')
+for j in radarr-scan sonarr-scan jellyfin-full-scan; do
+  curl -s -X POST -H "X-Api-Key: $K" http://127.0.0.1:5055/api/v1/settings/jobs/$j/run >/dev/null; done
+sleep 45
+curl -s -H "X-Api-Key: $K" 'http://127.0.0.1:5055/api/v1/search?query=Mayday&page=1' | grep -o '"status":[0-9]' | head -1
+# "status":5 = available. Shows with only some episodes are 4.
+```
+
+Requests made as the admin are auto-approved. Other Jellyfin users can sign in straight away, but their requests wait for approval unless you grant *Auto-Approve* under *Users* in Seerr.
 
 ---
 
@@ -2020,7 +2086,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://192.168.8.217:8080/   # gopodder
 curl -s http://192.168.8.218:8080/api/auth/status      # m3ugoat, {"enabled":true,...}
 curl -s http://192.168.8.220:8096/System/Info/Public    # jellyfin, Version 12.1.0
 sudo pct exec 109 -- /usr/local/bin/kodi-rpc AudioLibrary.GetSongs '{"limits":{"end":1}}'   # kodi, "total":13753
-sudo pct exec 107 -- docker compose -f /opt/arr/docker-compose.yml ps   # 6 services Up
+sudo pct exec 107 -- docker compose -f /opt/arr/docker-compose.yml ps   # 7 services Up
 
 # *arr stack — the two things that actually break
 sudo pct exec 107 -- docker exec sonarr sh -c '
@@ -2046,7 +2112,7 @@ tailscale status
 tailscale ip -4                                    # YOUR_TAILNET_IP
 ```
 
-Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `http://192.168.8.217:8080`, `http://192.168.8.218:8080`, `http://192.168.8.220:8096`, `http://192.168.8.221:8080` (Kodi, password-protected), `https://192.168.8.191:8006` — plus the *arr stack on `192.168.8.219`: qBittorrent `:8080`, Prowlarr `:9696`, Sonarr `:8989`, Radarr `:7878`, Bazarr `:6767`.
+Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191:4533`, `http://192.168.8.214:13378`, `http://192.168.8.215:32400/web`, `http://192.168.8.216:8096`, `http://192.168.8.217:8080`, `http://192.168.8.218:8080`, `http://192.168.8.220:8096`, `http://192.168.8.221:8080` (Kodi, password-protected), `https://192.168.8.191:8006` — plus the *arr stack on `192.168.8.219`: qBittorrent `:8080`, Prowlarr `:9696`, Sonarr `:8989`, Radarr `:7878`, Bazarr `:6767`, Seerr `:5055`.
 
 ---
 
@@ -2056,7 +2122,7 @@ Then from the Mac: `smb://192.168.8.191/mbogiservershare`, `http://192.168.8.191
 - **Don't restart Navidrome mid-migration.** A version jump applies schema migrations on first start, and the FTS5 search index alone takes ~13 s on this library. Restarting during that aborts the running transaction (`level=fatal ... failed to begin transaction: context canceled`); the next start does resume at the interrupted migration and finish the rest, but wait for `Navidrome server is ready!` before touching the service.
 - **No PVE backup jobs are configured.** `/etc/pve/jobs.cfg` is empty and both `dump/` directories are empty — nothing is being backed up automatically. Worth adding a vzdump job to `nvme` storage if you care about the containers.
 - **`zfsutils-linux` is installed** (pulled in by PXVIRT) but no pool exists and the module isn't loaded. Ignore it.
-- **nginx on :80 serves the dashboard** — `/var/www/html/index.html`, a live status grid that polls `/api/status` every 5 seconds. That API is `hqdash`, a stdlib-Python service at `/opt/hqdash/hqdash.py` bound to `127.0.0.1:8787`; nginx proxies `/api/` to it and is what keeps it off the LAN. Every service it can see or control is an entry in the `TARGETS` dict at the top of that file, so **adding a container means editing `TARGETS` and `sudo systemctl restart hqdash`** — a target is an LXC (`kind: lxc`), a host systemd unit (`kind: unit`), or, since CT 107, a single Docker service inside an LXC (`kind: docker`, with `vmid` + `container`), which is how the six *arr services get their own cards instead of one — the page itself is entirely data-driven and needs no edit. `/opt/hqdash/README.md` documents it. It replaced a hand-written grid of static links, kept as `index.html.bak-pre-hqdash-20260901`; the stock Debian page is still there as `index.nginx-debian.html`.
+- **nginx on :80 serves the dashboard** — `/var/www/html/index.html`, a live status grid that polls `/api/status` every 5 seconds. That API is `hqdash`, a stdlib-Python service at `/opt/hqdash/hqdash.py` bound to `127.0.0.1:8787`; nginx proxies `/api/` to it and is what keeps it off the LAN. Every service it can see or control is an entry in the `TARGETS` dict at the top of that file, so **adding a container means editing `TARGETS` and `sudo systemctl restart hqdash`** — a target is an LXC (`kind: lxc`), a host systemd unit (`kind: unit`), or, since CT 107, a single Docker service inside an LXC (`kind: docker`, with `vmid` + `container`), which is how the seven CT 107 services get their own cards instead of one — the page itself is entirely data-driven and needs no edit. `/opt/hqdash/README.md` documents it. It replaced a hand-written grid of static links, kept as `index.html.bak-pre-hqdash-20260901`; the stock Debian page is still there as `index.nginx-debian.html`.
 - **The dashboard has no authentication.** Anyone on the LAN or the tailnet can start, stop and restart every service on the box, and reboot the Pi. That is the same trust boundary as the Proxmox UI on :8006 and it holds only because :80 is not forwarded and the line is behind CGNAT. Put auth in front of it before exposing it to anything.
 - **`samba-ad-dc.service` is enabled** but the server is a standalone file server. Harmless.
 - **`postfix` is running** on localhost only, for PVE's mail notifications.
