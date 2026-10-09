@@ -4,7 +4,7 @@ description: How LyricsPriority resolution works, what nd-lyrics writes to disk,
 permalink: /navidrome-lyrics/
 ---
 
-Companion to section 12a of the [rebuild guide](/). Everything here is Navidrome **0.63.2** with [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) **v7.2.0**.
+Companion to section 5a of the [rebuild guide](/). Everything here is Navidrome **0.63.2** with [navidrome-lyrics-plugin](https://github.com/J0R6IT0/navidrome-lyrics-plugin) **v7.2.0**.
 
 ---
 
